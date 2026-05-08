@@ -1,143 +1,121 @@
+/*
+ * TAI Project 2 — Astronomical Image Compressor (ox-astro-fast)
+ *
+ * Optimised for minimum latency.
+ *
+ * Pipeline:
+ *   1. Read raw bytes; interpret as 2D big-endian uint16_t array.
+ *   2. Horizontal delta prediction: pred = left neighbour (or 0 at row start).
+ *   3. Wrapping residual → modular zigzag.
+ *   4. Split into hi and lo bytes.
+ *   5. Encode hi with a single ORDER-0 adaptive model.
+ *      Encode lo with a single ORDER-0 adaptive model.
+ *
+ * Two models total (vs 257 for balanced, 512 for ratio) → excellent cache
+ * behaviour and minimal per-pixel overhead.
+ *
+ * Compressed file format
+ * ──────────────────────
+ *  Bytes  0–3  : magic "TA2F"
+ *  Bytes  4–7  : width   uint32_t LE
+ *  Bytes  8–11 : height  uint32_t LE
+ *  Bytes 12+   : range-coded bitstream
+ *
+ * Usage:  compress_astro_fast <input_file> <output_file>
+ *         compress_astro_fast          (stdin → stdout)
+ */
+
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <sstream>
-#include <stdexcept>
-#include <string>
 #include <vector>
 
-#include "common/FastFormat.hpp"
-#include "common/OrderedParallelProcessor.hpp"
 #include "coder/RangeCoder.hpp"
-#include "model/FastOrder0Model.hpp"
+#include "coder/FrequencyTable.hpp"
+#include "model/ImagePredictor.hpp"
 
-namespace {
+static constexpr uint8_t MAGIC[4] = {'T','A','2','F'};
 
-constexpr std::size_t kWorkerCount = 8;
-constexpr std::size_t kMaxPendingBlocks = 16;
-
-struct CompressionTask {
-    std::string data;
-};
-
-struct EncodedBlock {
-    fast::BlockMode mode;
-    std::uint32_t raw_size;
-    std::string payload;
-};
-
-static std::string compressBlock(const char *data, std::size_t size) {
-    std::ostringstream payload(std::ios::binary | std::ios::out);
-    RangeEncoder encoder(payload);
-    FastOrder0Model model;
-
-    for (std::size_t i = 0; i < size; i++)
-        model.encodeSymbol(encoder, static_cast<std::uint8_t>(data[i]));
-
-    encoder.finish();
-    return payload.str();
+static void write_u32le(std::ostream& out, uint32_t v) {
+    out.put(static_cast<char>(v         & 0xFF));
+    out.put(static_cast<char>((v >>  8) & 0xFF));
+    out.put(static_cast<char>((v >> 16) & 0xFF));
+    out.put(static_cast<char>((v >> 24) & 0xFF));
 }
 
-EncodedBlock processBlock(CompressionTask task) {
-    const std::uint32_t raw_size = static_cast<std::uint32_t>(task.data.size());
-    std::string compressed = compressBlock(task.data.data(), task.data.size());
-
-    if (compressed.size() >= task.data.size()) {
-        return EncodedBlock{fast::BlockMode::Raw, raw_size, std::move(task.data)};
-    }
-
-    return EncodedBlock{fast::BlockMode::RangeCoded, raw_size, std::move(compressed)};
+static SimpleFrequencyTable make_flat256() {
+    return SimpleFrequencyTable(std::vector<uint32_t>(256, 1u));
 }
 
-}  // namespace
+int main(int argc, char* argv[]) {
+    std::istream* in_ptr  = &std::cin;
+    std::ostream* out_ptr = &std::cout;
+    std::ifstream fin;
+    std::ofstream fout;
 
-int main(int argc, char *argv[]) {
-    if (argc != 1 && argc != 3) {
-        std::cerr << "Usage: compress <input_file> <output_file>\n"
-                     "       compress          (stdin -> stdout)\n";
-        return EXIT_FAILURE;
+    if (argc >= 3) {
+        fin.open(argv[1], std::ios::binary);
+        if (!fin)  { std::cerr << "Cannot open input: "  << argv[1] << '\n'; return 1; }
+        fout.open(argv[2], std::ios::binary);
+        if (!fout) { std::cerr << "Cannot open output: " << argv[2] << '\n'; return 1; }
+        in_ptr  = &fin;
+        out_ptr = &fout;
+    } else if (argc == 1) {
+        std::cin.sync_with_stdio(false);
+    } else {
+        std::cerr << "Usage: compress_astro_fast <input> <output>\n"; return 1;
     }
 
-    std::ios::sync_with_stdio(false);
-    std::cin.tie(nullptr);
-
-    std::ifstream file_in;
-    if (argc == 3) {
-        file_in.open(argv[1], std::ios::binary);
-        if (!file_in) {
-            std::cerr << "Error: cannot open input file: " << argv[1] << "\n";
-            return EXIT_FAILURE;
-        }
-    }
-    std::istream &in = (argc == 3) ? static_cast<std::istream &>(file_in) : std::cin;
-
-    std::ofstream file_out;
-    if (argc == 3) {
-        file_out.open(argv[2], std::ios::binary);
-        if (!file_out) {
-            std::cerr << "Error: cannot open output file: " << argv[2] << "\n";
-            return EXIT_FAILURE;
-        }
-    }
-    std::ostream &out = (argc == 3) ? static_cast<std::ostream &>(file_out) : std::cout;
-
-    out.write(fast::kMagic, 4);
-    fast::writeUint32(out, fast::kBlockSize);
-
-    try {
-        OrderedParallelProcessor<CompressionTask, EncodedBlock> processor(
-            kWorkerCount, processBlock);
-
-        std::size_t submitted = 0;
-        std::size_t next_to_write = 0;
-
-        while (true) {
-            std::string block(fast::kBlockSize, '\0');
-            in.read(block.data(), static_cast<std::streamsize>(block.size()));
-            std::streamsize got = in.gcount();
-            if (got <= 0)
-                break;
-
-            while (submitted - next_to_write >= kMaxPendingBlocks) {
-                EncodedBlock ready_block = processor.takeNext(next_to_write);
-                out.put(static_cast<char>(ready_block.mode));
-                fast::writeUint32(out, ready_block.raw_size);
-                fast::writeUint32(out, static_cast<std::uint32_t>(ready_block.payload.size()));
-                out.write(ready_block.payload.data(),
-                          static_cast<std::streamsize>(ready_block.payload.size()));
-                next_to_write++;
-            }
-
-            block.resize(static_cast<std::size_t>(got));
-            processor.submit(submitted, CompressionTask{std::move(block)});
-            submitted++;
-
-            EncodedBlock ready_block{};
-            while (processor.tryTakeNext(next_to_write, ready_block)) {
-                out.put(static_cast<char>(ready_block.mode));
-                fast::writeUint32(out, ready_block.raw_size);
-                fast::writeUint32(out, static_cast<std::uint32_t>(ready_block.payload.size()));
-                out.write(ready_block.payload.data(),
-                          static_cast<std::streamsize>(ready_block.payload.size()));
-                next_to_write++;
-            }
-        }
-
-        processor.closeInput();
-        while (next_to_write < submitted) {
-            EncodedBlock ready_block = processor.takeNext(next_to_write);
-            out.put(static_cast<char>(ready_block.mode));
-            fast::writeUint32(out, ready_block.raw_size);
-            fast::writeUint32(out, static_cast<std::uint32_t>(ready_block.payload.size()));
-            out.write(ready_block.payload.data(),
-                      static_cast<std::streamsize>(ready_block.payload.size()));
-            next_to_write++;
-        }
-    } catch (const std::exception &ex) {
-        std::cerr << "Error: " << ex.what() << "\n";
-        return EXIT_FAILURE;
+    std::vector<uint8_t> raw(std::istreambuf_iterator<char>(*in_ptr), {});
+    if (raw.size() % 2 != 0) {
+        std::cerr << "Input size not even\n"; return 1;
     }
 
-    return out ? EXIT_SUCCESS : EXIT_FAILURE;
+    const uint64_t npix = raw.size() / 2;
+    uint32_t width = 0, height = 0;
+    uint32_t sq = static_cast<uint32_t>(std::sqrt(static_cast<double>(npix)));
+    if ((uint64_t)sq * sq == npix) {
+        width = height = sq;
+    } else {
+        width = static_cast<uint32_t>(npix); height = 1;
+        for (uint32_t w : {1500u, 2048u, 1024u, 512u, 256u})
+            if (npix % w == 0) { width = w; height = static_cast<uint32_t>(npix / w); break; }
+    }
+
+    std::vector<uint16_t> pixels(npix);
+    for (uint64_t i = 0; i < npix; ++i)
+        pixels[i] = (static_cast<uint16_t>(raw[2*i]) << 8) | raw[2*i+1];
+
+    out_ptr->write(reinterpret_cast<const char*>(MAGIC), 4);
+    write_u32le(*out_ptr, width);
+    write_u32le(*out_ptr, height);
+
+    // Two ORDER-0 models: one for hi bytes, one for lo bytes
+    SimpleFrequencyTable hi_model = make_flat256();
+    SimpleFrequencyTable lo_model = make_flat256();
+
+    RangeEncoder enc(*out_ptr);
+
+    for (uint32_t row = 0; row < height; ++row) {
+        for (uint32_t col = 0; col < width; ++col) {
+            uint16_t px   = pixels[row * width + col];
+            // Horizontal delta: predict from left neighbour; restart at each row
+            uint16_t pred = (col > 0) ? pixels[row * width + col - 1] : 0u;
+            uint16_t u    = zigzag_encode(static_cast<uint16_t>(px - pred));
+
+            uint8_t hi = static_cast<uint8_t>(u >> 8);
+            uint8_t lo = static_cast<uint8_t>(u & 0xFF);
+
+            enc.write(hi_model, hi);
+            hi_model.increment(hi);
+
+            enc.write(lo_model, lo);
+            lo_model.increment(lo);
+        }
+    }
+
+    enc.finish();
+    return 0;
 }

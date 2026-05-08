@@ -1,255 +1,101 @@
 /*
- * TAI Project 1 — MTF+ORDER=0 Decompressor (BWT whole-file + parallel MTF chunks)
+ * TAI Project 2 — Astronomical Image Decompressor (ox-astro-balanced)
  *
- * Usage:  decompress <compressed_file> <output_file>
- *         decompress          (stdin → stdout)
+ * Usage:  decompress_astro_balanced <input_file> <output_file>
+ *         decompress_astro_balanced          (stdin → stdout)
  */
 
-#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
-#include <future>
 #include <iostream>
-#include <numeric>
-#include <sstream>
 #include <vector>
 
 #include "coder/RangeCoder.hpp"
 #include "coder/FrequencyTable.hpp"
-#include "coder/FenwickFrequencyTable.hpp"
-#include "model/BwtTransform.hpp"
+#include "model/ImagePredictor.hpp"
 
+static constexpr uint8_t MAGIC[4] = {'T','A','2','B'};
 
-// ── Per-chunk data ────────────────────────────────────────────────────────────
-struct ChunkData {
-    uint32_t k;
-    std::vector<uint8_t> alphabet;
-    std::vector<uint8_t> bitstream;
-};
-
-
-// ── Decode one chunk -> portion of bwt_data (runs in a worker thread) ─────────
-static std::vector<uint8_t> decompress_chunk(const ChunkData &cd)
-{
-    // MTF list: [0, 1, ..., k-1]
-    std::vector<uint32_t> mtf_list(cd.k);
-    std::iota(mtf_list.begin(), mtf_list.end(), 0u);
-
-    // Same models as compressor — Fenwick for O(log k) findSymbol
-    FenwickFrequencyTable rank_model(cd.k + 1);
-    for (uint32_t i = 0; i <= cd.k; i++) rank_model.increment(i);
-    constexpr uint32_t COUNT_CTXS = 4;
-    constexpr uint32_t THRESH = 8u;
-    auto rank_ctx = [](uint32_t r) -> uint32_t {
-        if (r == 0) return 0;
-        if (r == 1) return 1;
-        if (r <= 3) return 2;
-        return 3;
-    };
-    std::vector<uint32_t> cnt_init(THRESH + 1, 1u);
-    std::vector<SimpleFrequencyTable> cnt_models(COUNT_CTXS, SimpleFrequencyTable(cnt_init));
-    std::vector<uint32_t> exp_init(32, 1u);
-    SimpleFrequencyTable exp_model(exp_init);
-    std::vector<uint32_t> bit_init(2, 1u);
-    SimpleFrequencyTable bit_model(bit_init);
-
-    std::string raw(cd.bitstream.begin(), cd.bitstream.end());
-    std::istringstream buf(raw, std::ios::binary);
-    RangeDecoder dec(buf);
-
-    std::vector<uint8_t> bwt_portion;
-
-    while (true) {
-        uint32_t r = dec.read(rank_model);
-        if (r == cd.k) break;  // EOF marker
-        rank_model.increment(r);
-
-        // Recover symbol at rank r, move to front
-        uint32_t sym = mtf_list[r];
-        for (uint32_t i = r; i > 0; i--) mtf_list[i] = mtf_list[i - 1];
-        mtf_list[0] = sym;
-
-        // Decode count via direct adaptive model
-        uint32_t ctx = rank_ctx(r);
-        uint32_t sym_cnt = dec.read(cnt_models[ctx]);
-        cnt_models[ctx].increment(sym_cnt);
-
-        uint32_t cnt;
-        if (sym_cnt < THRESH) {
-            cnt = sym_cnt + 1u;  // counts 1..THRESH
-        } else {
-            // Elias-gamma for overflow counts
-            uint32_t b = dec.read(exp_model);
-            exp_model.increment(b);
-            uint32_t residual = 0;
-            for (uint32_t j = 0; j < b; j++)
-                residual = (residual << 1) | dec.read(bit_model);
-            cnt = (1u << b) | residual;
-        }
-
-        uint8_t byte = cd.alphabet[sym];
-        for (uint32_t j = 0; j < cnt; j++)
-            bwt_portion.push_back(byte);
-    }
-
-    return bwt_portion;
+static uint32_t read_u32le(std::istream& in) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i)
+        v |= static_cast<uint32_t>(static_cast<uint8_t>(in.get())) << (8 * i);
+    return v;
 }
 
-
-// ── ORDER-0 adaptive range decoding of raw bytes ─────────────────────────────
-// Uses FenwickFrequencyTable for O(log 256) findSymbol per symbol.
-static std::vector<uint8_t> order0_decode(const std::vector<uint8_t>& bitstream,uint32_t original_size) 
-{
-    FenwickFrequencyTable model(256);
-    for (int i = 0; i < 256; i++) model.increment(i);
-    std::string raw(bitstream.begin(), bitstream.end());
-    std::istringstream buf(raw, std::ios::binary);
-    RangeDecoder dec(buf);
-    std::vector<uint8_t> result;
-    result.reserve(original_size);
-    for (uint32_t i = 0; i < original_size; i++) {
-        uint32_t sym = dec.read(model);
-        model.increment(sym);
-        result.push_back(static_cast<uint8_t>(sym));
-    }
-    return result;
+static SimpleFrequencyTable make_flat256() {
+    return SimpleFrequencyTable(std::vector<uint32_t>(256, 1u));
 }
 
+int main(int argc, char* argv[]) {
+    std::istream* in_ptr  = &std::cin;
+    std::ostream* out_ptr = &std::cout;
+    std::ifstream fin;
+    std::ofstream fout;
 
-// ── Read a uint32_t little-endian ─────────────────────────────────────────────
-static bool read_u32le(std::istream &in, uint32_t &v) {
-    v = 0;
-    for (int i = 0; i < 4; i++) {
-        int b = in.get();
-        if (!in) return false;
-        v |= static_cast<uint32_t>(static_cast<uint8_t>(b)) << (i * 8);
-    }
-    return true;
-}
-
-
-int main(int argc, char *argv[]) {
-    if (argc != 1 && argc != 3) {
-        std::cerr << "Usage: decompress <compressed_file> <output_file>\n"
-                     "       decompress          (stdin -> stdout)\n";
-        return EXIT_FAILURE;
-    }
-
-    // ── Open input ────────────────────────────────────────────────────────────
-    std::ifstream file_in;
-    if (argc == 3) {
-        file_in.open(argv[1], std::ios::binary);
-        if (!file_in) {
-            std::cerr << "Error: cannot open input file: " << argv[1] << "\n";
-            return EXIT_FAILURE;
-        }
-    }
-    std::istream &in = (argc == 3) ? static_cast<std::istream &>(file_in) : std::cin;
-
-    // ── Read mode byte ────────────────────────────────────────────────────────
-    int mode_byte = in.get();
-    if (!in) {
-        std::cerr << "Error: empty or truncated input.\n";
-        return EXIT_FAILURE;
-    }
-    uint8_t mode = static_cast<uint8_t>(mode_byte);
-
-    // ── Open output ───────────────────────────────────────────────────────────
-    std::ofstream file_out;
-    if (argc == 3) {
-        file_out.open(argv[2], std::ios::binary);
-        if (!file_out) {
-            std::cerr << "Error: cannot open output file: " << argv[2] << "\n";
-            return EXIT_FAILURE;
-        }
-    }
-    std::ostream &out = (argc == 3) ? static_cast<std::ostream &>(file_out) : std::cout;
-
-    if (mode == 1) {
-        // ── ORDER-0 path ──────────────────────────────────────────────────────
-        uint32_t original_size = 0, bitstream_size = 0;
-        if (!read_u32le(in, original_size) || !read_u32le(in, bitstream_size)) {
-            std::cerr << "Error: truncated ORDER-0 header.\n";
-            return EXIT_FAILURE;
-        }
-        std::vector<uint8_t> bitstream(bitstream_size);
-        in.read(reinterpret_cast<char *>(bitstream.data()),
-                static_cast<std::streamsize>(bitstream_size));
-        if (!in) {
-            std::cerr << "Error: truncated ORDER-0 bitstream.\n";
-            return EXIT_FAILURE;
-        }
-        std::vector<uint8_t> original = order0_decode(bitstream, original_size);
-        out.write(reinterpret_cast<const char *>(original.data()),
-                  static_cast<std::streamsize>(original.size()));
-        return EXIT_SUCCESS;
+    if (argc >= 3) {
+        fin.open(argv[1], std::ios::binary);
+        if (!fin)  { std::cerr << "Cannot open input: "  << argv[1] << '\n'; return 1; }
+        fout.open(argv[2], std::ios::binary);
+        if (!fout) { std::cerr << "Cannot open output: " << argv[2] << '\n'; return 1; }
+        in_ptr  = &fin;
+        out_ptr = &fout;
+    } else if (argc == 1) {
+        std::cin.sync_with_stdio(false);
+    } else {
+        std::cerr << "Usage: decompress_astro_balanced <input> <output>\n"; return 1;
     }
 
-    // ── BWT+MTF path (mode == 0) ──────────────────────────────────────────────
-    uint32_t primary_index = 0, num_chunks = 0;
-    if (!read_u32le(in, primary_index) || !read_u32le(in, num_chunks)) {
-        std::cerr << "Error: truncated global header.\n";
-        return EXIT_FAILURE;
-    }
+    uint8_t magic[4];
+    in_ptr->read(reinterpret_cast<char*>(magic), 4);
+    for (int i = 0; i < 4; ++i)
+        if (magic[i] != MAGIC[i]) { std::cerr << "Bad magic\n"; return 1; }
 
-    // ── Read all chunk headers + bitstreams ───────────────────────────────────
-    std::vector<ChunkData> chunks(num_chunks);
-    for (uint32_t i = 0; i < num_chunks; i++) {
-        ChunkData &cd = chunks[i];
+    const uint32_t width  = read_u32le(*in_ptr);
+    const uint32_t height = read_u32le(*in_ptr);
+    const uint64_t npix   = static_cast<uint64_t>(width) * height;
 
-        uint32_t bitstream_size = 0;
-        if (!read_u32le(in, bitstream_size)) {
-            std::cerr << "Error: truncated bitstream_size (chunk " << i << ").\n";
-            return EXIT_FAILURE;
-        }
+    std::vector<uint16_t> pixels(npix);
 
-        uint32_t k_raw = static_cast<uint8_t>(in.get());
-        if (!in) {
-            std::cerr << "Error: truncated k_raw (chunk " << i << ").\n";
-            return EXIT_FAILURE;
-        }
-        cd.k = (k_raw == 0u) ? 256u : k_raw;
+    std::vector<SimpleFrequencyTable> hi_models;
+    hi_models.reserve(256);
+    for (int i = 0; i < 256; ++i)
+        hi_models.push_back(make_flat256());
 
-        cd.alphabet.resize(cd.k);
-        if (k_raw != 0u) {
-            in.read(reinterpret_cast<char *>(cd.alphabet.data()),
-                    static_cast<std::streamsize>(cd.k));
-            if (!in) {
-                std::cerr << "Error: truncated alphabet (chunk " << i << ").\n";
-                return EXIT_FAILURE;
-            }
-        } else {
-            for (uint32_t j = 0; j < 256u; j++)
-                cd.alphabet[j] = static_cast<uint8_t>(j);
-        }
+    SimpleFrequencyTable lo_model = make_flat256();
 
-        cd.bitstream.resize(bitstream_size);
-        in.read(reinterpret_cast<char *>(cd.bitstream.data()),
-                static_cast<std::streamsize>(bitstream_size));
-        if (!in) {
-            std::cerr << "Error: truncated bitstream (chunk " << i << ").\n";
-            return EXIT_FAILURE;
+    RangeDecoder dec(*in_ptr);
+
+    uint8_t prev_hi = 0;
+    for (uint32_t row = 0; row < height; ++row) {
+        for (uint32_t col = 0; col < width; ++col) {
+            uint8_t hi = static_cast<uint8_t>(dec.read(hi_models[prev_hi]));
+            hi_models[prev_hi].increment(hi);
+
+            uint8_t lo = static_cast<uint8_t>(dec.read(lo_model));
+            lo_model.increment(lo);
+
+            uint16_t z    = (static_cast<uint16_t>(hi) << 8) | lo;
+            uint16_t u    = zigzag_decode(z);
+
+            uint16_t W  = (col > 0)            ? pixels[row * width + col - 1]       : 0u;
+            uint16_t N  = (row > 0)            ? pixels[(row-1) * width + col]        : W;
+            uint16_t NW = (row > 0 && col > 0) ? pixels[(row-1) * width + col - 1]   : W;
+
+            uint16_t pred = (row == 0 && col == 0) ? 0u : med_predict(W, N, NW);
+            pixels[row * width + col] = static_cast<uint16_t>(pred + u);
+
+            prev_hi = hi;
         }
     }
 
-    // ── Decode chunks in parallel ─────────────────────────────────────────────
-    std::vector<std::future<std::vector<uint8_t>>> futures;
-    futures.reserve(num_chunks);
-    for (const auto &cd : chunks)
-        futures.push_back(std::async(std::launch::async, decompress_chunk, cd));
-
-    // ── Assemble full bwt_buf in order ────────────────────────────────────────
-    std::vector<uint8_t> bwt_buf;
-    for (auto &f : futures) {
-        std::vector<uint8_t> portion = f.get();
-        bwt_buf.insert(bwt_buf.end(), portion.begin(), portion.end());
+    std::vector<uint8_t> out_bytes(npix * 2);
+    for (uint64_t i = 0; i < npix; ++i) {
+        out_bytes[2*i]   = static_cast<uint8_t>(pixels[i] >> 8);
+        out_bytes[2*i+1] = static_cast<uint8_t>(pixels[i] & 0xFF);
     }
-
-    // ── BWT inverse on the whole buffer ───────────────────────────────────────
-    std::vector<uint8_t> original = bwt_inverse(bwt_buf, primary_index);
-    out.write(reinterpret_cast<const char *>(original.data()),
-              static_cast<std::streamsize>(original.size()));
-
-    return EXIT_SUCCESS;
+    out_ptr->write(reinterpret_cast<const char*>(out_bytes.data()),
+                   static_cast<std::streamsize>(out_bytes.size()));
+    return 0;
 }

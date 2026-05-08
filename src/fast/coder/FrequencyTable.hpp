@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <vector>
 
-
 /*
  * A table of symbol frequencies indexed from 0 to getSymbolLimit()-1.
  * Supports any alphabet size set at construction time.
@@ -29,12 +28,9 @@ class FrequencyTable {
 	public: virtual std::uint32_t getHigh(std::uint32_t symbol) const = 0;
 
 	// Find symbol s such that getLow(s) <= value < getHigh(s).
-	// Default: O(log^2 N) binary search. Subclasses may override for O(log N).
 	public: virtual std::uint32_t findSymbol(std::uint32_t value) const;
 
 };
-
-
 
 /*
  * Flat (uniform) frequency table — each symbol has frequency 1.
@@ -56,8 +52,6 @@ class FlatFrequencyTable final : public FrequencyTable {
 	private: void checkSymbol(std::uint32_t symbol) const;
 
 };
-
-
 
 /*
  * Mutable frequency table backed by a vector. Cumulative sums are computed lazily.

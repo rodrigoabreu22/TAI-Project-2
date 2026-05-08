@@ -11,7 +11,6 @@
 
 using std::uint32_t;
 
-
 FrequencyTable::~FrequencyTable() {}
 
 uint32_t FrequencyTable::findSymbol(uint32_t value) const {
@@ -19,7 +18,7 @@ uint32_t FrequencyTable::findSymbol(uint32_t value) const {
 	while (hi - lo > 1) {
 		uint32_t mid = lo + (hi - lo) / 2;
 		if (getLow(mid) > value) hi = mid;
-		else                     lo = mid;
+		else lo = mid;
 	}
 	return lo;
 }

@@ -1,155 +1,90 @@
+/*
+ * TAI Project 2 — Astronomical Image Decompressor (ox-astro-fast)
+ *
+ * Usage:  decompress_astro_fast <input_file> <output_file>
+ *         decompress_astro_fast          (stdin → stdout)
+ */
+
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <sstream>
-#include <stdexcept>
-#include <string>
 #include <vector>
 
-#include "common/FastFormat.hpp"
-#include "common/OrderedParallelProcessor.hpp"
 #include "coder/RangeCoder.hpp"
-#include "model/FastOrder0Model.hpp"
+#include "coder/FrequencyTable.hpp"
+#include "model/ImagePredictor.hpp"
 
-namespace {
+static constexpr uint8_t MAGIC[4] = {'T','A','2','F'};
 
-constexpr std::size_t kWorkerCount = 8;
-constexpr std::size_t kMaxPendingBlocks = 16;
-
-struct DecompressionTask {
-    fast::BlockMode mode;
-    std::uint32_t raw_size;
-    std::string payload;
-};
-
-std::string processBlock(DecompressionTask task) {
-    if (task.mode == fast::BlockMode::Raw) {
-        if (task.payload.size() != task.raw_size)
-            throw std::runtime_error("invalid raw block.");
-        return task.payload;
-    }
-
-    if (task.mode != fast::BlockMode::RangeCoded)
-        throw std::runtime_error("invalid block mode.");
-
-    std::istringstream payload_in(task.payload, std::ios::binary | std::ios::in);
-    RangeDecoder decoder(payload_in);
-    FastOrder0Model model;
-    std::string block(task.raw_size, '\0');
-
-    for (std::uint32_t i = 0; i < task.raw_size; i++)
-        block[static_cast<std::size_t>(i)] = static_cast<char>(model.decodeSymbol(decoder));
-
-    return block;
+static uint32_t read_u32le(std::istream& in) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i)
+        v |= static_cast<uint32_t>(static_cast<uint8_t>(in.get())) << (8 * i);
+    return v;
 }
 
-}  // namespace
+static SimpleFrequencyTable make_flat256() {
+    return SimpleFrequencyTable(std::vector<uint32_t>(256, 1u));
+}
 
-int main(int argc, char *argv[]) {
-    if (argc != 1 && argc != 3) {
-        std::cerr << "Usage: decompress <compressed_file> <output_file>\n"
-                     "       decompress          (stdin -> stdout)\n";
-        return EXIT_FAILURE;
+int main(int argc, char* argv[]) {
+    std::istream* in_ptr  = &std::cin;
+    std::ostream* out_ptr = &std::cout;
+    std::ifstream fin;
+    std::ofstream fout;
+
+    if (argc >= 3) {
+        fin.open(argv[1], std::ios::binary);
+        if (!fin)  { std::cerr << "Cannot open input: "  << argv[1] << '\n'; return 1; }
+        fout.open(argv[2], std::ios::binary);
+        if (!fout) { std::cerr << "Cannot open output: " << argv[2] << '\n'; return 1; }
+        in_ptr  = &fin;
+        out_ptr = &fout;
+    } else if (argc == 1) {
+        std::cin.sync_with_stdio(false);
+    } else {
+        std::cerr << "Usage: decompress_astro_fast <input> <output>\n"; return 1;
     }
 
-    std::ios::sync_with_stdio(false);
-    std::cin.tie(nullptr);
+    uint8_t magic[4];
+    in_ptr->read(reinterpret_cast<char*>(magic), 4);
+    for (int i = 0; i < 4; ++i)
+        if (magic[i] != MAGIC[i]) { std::cerr << "Bad magic\n"; return 1; }
 
-    std::ifstream file_in;
-    if (argc == 3) {
-        file_in.open(argv[1], std::ios::binary);
-        if (!file_in) {
-            std::cerr << "Error: cannot open input file: " << argv[1] << "\n";
-            return EXIT_FAILURE;
+    const uint32_t width  = read_u32le(*in_ptr);
+    const uint32_t height = read_u32le(*in_ptr);
+    const uint64_t npix   = static_cast<uint64_t>(width) * height;
+
+    std::vector<uint16_t> pixels(npix);
+
+    SimpleFrequencyTable hi_model = make_flat256();
+    SimpleFrequencyTable lo_model = make_flat256();
+
+    RangeDecoder dec(*in_ptr);
+
+    for (uint32_t row = 0; row < height; ++row) {
+        for (uint32_t col = 0; col < width; ++col) {
+            uint8_t hi = static_cast<uint8_t>(dec.read(hi_model));
+            hi_model.increment(hi);
+
+            uint8_t lo = static_cast<uint8_t>(dec.read(lo_model));
+            lo_model.increment(lo);
+
+            uint16_t z    = (static_cast<uint16_t>(hi) << 8) | lo;
+            uint16_t u    = zigzag_decode(z);
+
+            uint16_t pred = (col > 0) ? pixels[row * width + col - 1] : 0u;
+            pixels[row * width + col] = static_cast<uint16_t>(pred + u);
         }
     }
-    std::istream &in = (argc == 3) ? static_cast<std::istream &>(file_in) : std::cin;
 
-    std::ofstream file_out;
-    if (argc == 3) {
-        file_out.open(argv[2], std::ios::binary);
-        if (!file_out) {
-            std::cerr << "Error: cannot open output file: " << argv[2] << "\n";
-            return EXIT_FAILURE;
-        }
+    std::vector<uint8_t> out_bytes(npix * 2);
+    for (uint64_t i = 0; i < npix; ++i) {
+        out_bytes[2*i]   = static_cast<uint8_t>(pixels[i] >> 8);
+        out_bytes[2*i+1] = static_cast<uint8_t>(pixels[i] & 0xFF);
     }
-    std::ostream &out = (argc == 3) ? static_cast<std::ostream &>(file_out) : std::cout;
-
-    char magic[4];
-    in.read(magic, 4);
-    if (!in || std::string(magic, 4) != std::string(fast::kMagic, 4)) {
-        std::cerr << "Error: not a TAF1 compressed file.\n";
-        return EXIT_FAILURE;
-    }
-
-    std::uint32_t block_size = 0;
-    if (!fast::readUint32(in, block_size) || !fast::isValidBlockSize(block_size)) {
-        std::cerr << "Error: invalid header.\n";
-        return EXIT_FAILURE;
-    }
-
-    try {
-        OrderedParallelProcessor<DecompressionTask, std::string> processor(
-            kWorkerCount, processBlock);
-
-        std::size_t submitted = 0;
-        std::size_t next_to_write = 0;
-
-        while (true) {
-            int mode_value = in.get();
-            if (mode_value == std::char_traits<char>::eof())
-                break;
-
-            std::uint32_t raw_size = 0;
-            std::uint32_t payload_size = 0;
-            if (!fast::readUint32(in, raw_size) || !fast::readUint32(in, payload_size)) {
-                std::cerr << "Error: truncated block header.\n";
-                return EXIT_FAILURE;
-            }
-            if (raw_size > block_size || payload_size > (block_size * 2u + 64u)) {
-                std::cerr << "Error: invalid block sizes.\n";
-                return EXIT_FAILURE;
-            }
-
-            std::string payload(payload_size, '\0');
-            in.read(payload.data(), static_cast<std::streamsize>(payload_size));
-            if (!in) {
-                std::cerr << "Error: truncated block payload.\n";
-                return EXIT_FAILURE;
-            }
-
-            while (submitted - next_to_write >= kMaxPendingBlocks) {
-                std::string ready_block = processor.takeNext(next_to_write);
-                out.write(ready_block.data(), static_cast<std::streamsize>(ready_block.size()));
-                next_to_write++;
-            }
-
-            processor.submit(submitted, DecompressionTask{
-                                            static_cast<fast::BlockMode>(
-                                                static_cast<std::uint8_t>(mode_value)),
-                                            raw_size,
-                                            std::move(payload),
-                                        });
-            submitted++;
-
-            std::string ready_block;
-            while (processor.tryTakeNext(next_to_write, ready_block)) {
-                out.write(ready_block.data(), static_cast<std::streamsize>(ready_block.size()));
-                next_to_write++;
-            }
-        }
-
-        processor.closeInput();
-        while (next_to_write < submitted) {
-            std::string ready_block = processor.takeNext(next_to_write);
-            out.write(ready_block.data(), static_cast<std::streamsize>(ready_block.size()));
-            next_to_write++;
-        }
-    } catch (const std::exception &ex) {
-        std::cerr << "Error: " << ex.what() << "\n";
-        return EXIT_FAILURE;
-    }
-
-    return out ? EXIT_SUCCESS : EXIT_FAILURE;
+    out_ptr->write(reinterpret_cast<const char*>(out_bytes.data()),
+                   static_cast<std::streamsize>(out_bytes.size()));
+    return 0;
 }

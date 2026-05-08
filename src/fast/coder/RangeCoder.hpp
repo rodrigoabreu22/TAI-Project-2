@@ -1,15 +1,12 @@
 /*
  * Byte-level range coder (LZMA-style carry propagation).
  *
- * Replaces ArithmeticEncoder + BitOutputStream  →  RangeEncoder(ostream&)
- * Replaces ArithmeticDecoder + BitInputStream   →  RangeDecoder(istream&)
- *
  * Same interface: write(FrequencyTable&, symbol) / read(FrequencyTable&).
- * Renormalises every 8 bits (~8× fewer renorm calls than the bit-level coder).
+ * Renormalises every 8 bits.
  *
  * Invariant: range_ always in [RC_TOP, 0xFFFFFFFF] after each renorm.
  * RC_TOP = 2^24 = 16 777 216.  Works correctly as long as FrequencyTable
- * totals stay below RC_TOP; for our ≤12.5 MB files this is always satisfied.
+ * totals stay below RC_TOP
  */
 
 #pragma once
@@ -22,7 +19,6 @@
 
 static constexpr uint32_t RC_TOP = 1u << 24;  // renorm threshold
 
-
 // ── Range Encoder ─────────────────────────────────────────────────────────────
 //
 // Uses LZMA-style carry propagation:
@@ -34,14 +30,14 @@ static constexpr uint32_t RC_TOP = 1u << 24;  // renorm threshold
 //
 class RangeEncoder {
     std::ostream& out_;
-    uint64_t      low_;
-    uint32_t      range_;
-    uint8_t       cache_;
-    uint32_t      pending_;
+    uint64_t low_;
+    uint32_t range_;
+    uint8_t cache_;
+    uint32_t pending_;
 
     void shift_low() {
-        bool    carry = (low_ >> 32) != 0;
-        uint8_t top   = static_cast<uint8_t>(static_cast<uint32_t>(low_) >> 24);
+        bool carry = (low_ >> 32) != 0;
+        uint8_t top = static_cast<uint8_t>(static_cast<uint32_t>(low_) >> 24);
 
         if (top < 0xFFu || carry) {
             out_.put(static_cast<char>(cache_ + (carry ? 1u : 0u)));
@@ -49,7 +45,7 @@ class RangeEncoder {
             for (uint32_t i = 0; i < pending_; ++i)
                 out_.put(static_cast<char>(fill));
             pending_ = 0;
-            cache_   = top;
+            cache_ = top;
         } else {
             ++pending_;
         }
@@ -61,11 +57,14 @@ public:
     explicit RangeEncoder(std::ostream& o)
         : out_(o), low_(0), range_(0xFFFFFFFFu), cache_(0), pending_(0) {}
 
-    void write(uint32_t sym_low, uint32_t sym_high, uint32_t total) {
+    void write(const FrequencyTable& freqs, uint32_t symbol) {
+        uint32_t total = freqs.getTotal();
+        uint32_t sym_low = freqs.getLow(symbol);
+        uint32_t sym_high = freqs.getHigh(symbol);
+
         uint32_t r = range_ / total;
-        low_   += static_cast<uint64_t>(sym_low) * r;
-        range_  = (sym_high < total) ? (sym_high - sym_low) * r
-                                     : range_ - sym_low * r;
+        low_ += static_cast<uint64_t>(sym_low) * r;
+        range_ = (sym_high < total) ? (sym_high - sym_low) * r : range_ - sym_low * r;
 
         while (range_ < RC_TOP) {
             range_ <<= 8;
@@ -73,11 +72,7 @@ public:
         }
     }
 
-    void write(const FrequencyTable& freqs, uint32_t symbol) {
-        write(freqs.getLow(symbol), freqs.getHigh(symbol), freqs.getTotal());
-    }
-
-    // Flush all buffered state.  Must be called after the last symbol.
+    // Flush all buffered state. Must be called after the last symbol.
     void finish() {
         for (int i = 0; i < 5; ++i)
             shift_low();
@@ -91,8 +86,8 @@ public:
 //
 class RangeDecoder {
     std::istream& in_;
-    uint32_t      range_;
-    uint32_t      code_;
+    uint32_t range_;
+    uint32_t code_;
 
     uint8_t read_byte() {
         int b = in_.get();
@@ -105,32 +100,22 @@ public:
             code_ = (code_ << 8) | read_byte();
     }
 
-    uint32_t getTarget(uint32_t total) const {
-        uint32_t r     = range_ / total;
-        return std::min(code_ / r, total - 1u);
-    }
-
-    void consume(uint32_t sym_low, uint32_t sym_high, uint32_t total) {
-        uint32_t r = range_ / total;
-
-        code_  -= sym_low * r;
-        range_  = (sym_high < total) ? (sym_high - sym_low) * r
-                                     : range_ - sym_low * r;
-
-        while (range_ < RC_TOP) {
-            code_  = (code_ << 8) | read_byte();
-            range_ <<= 8;
-        }
-    }
-
     uint32_t read(const FrequencyTable& freqs) {
         uint32_t total = freqs.getTotal();
-        uint32_t value = getTarget(total);
-        uint32_t symbol   = freqs.findSymbol(value);
-        uint32_t sym_low  = freqs.getLow(symbol);
+        uint32_t r = range_ / total;
+        uint32_t value = std::min(code_ / r, total - 1u);
+
+        uint32_t symbol = freqs.findSymbol(value);
+        uint32_t sym_low = freqs.getLow(symbol);
         uint32_t sym_high = freqs.getHigh(symbol);
 
-        consume(sym_low, sym_high, total);
+        code_ -= sym_low * r;
+        range_ = (sym_high < total) ? (sym_high - sym_low) * r : range_ - sym_low * r;
+
+        while (range_ < RC_TOP) {
+            code_ = (code_ << 8) | read_byte();
+            range_ <<= 8;
+        }
         return symbol;
     }
 };
