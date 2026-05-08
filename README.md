@@ -3,14 +3,19 @@
 
 Data-specific lossless compressor for raw astronomical images. Input is a raw raster of **1500×1500 unsigned 16-bit integers (big-endian)**. Three independent compressors are provided, each targeting a different trade-off between compression ratio and speed.
 
+| Tool | Strategy | bits/byte (baseline) |
+|------|----------|---------------------|
+| `ox-astro-ratio`    | JPEG-LS MED + ORDER-1 hi + ORDER-1(hi) lo | 3.609 |
+| `ox-astro-balanced` | JPEG-LS MED + ORDER-1 hi + ORDER-0 lo     | 3.611 |
+| `ox-astro-fast`     | Horizontal delta + ORDER-0                | 3.601 |
 
 ## Authors
 
 | Name | GitHub | Assignment |
 |------|--------|------------|
-| Eduardo Lopes | [@odraude23](https://github.com/odraude23) | `ox-astro-fast` |
+| Eduardo Lopes | [@odraude23](https://github.com/odraude23) | `ox-astro-balanced` |
 | Rodrigo Abreu | [@rodrigoabreu22](https://github.com/rodrigoabreu22) | `ox-astro-ratio` |
-| Hugo Ribeiro  | [@xHuGODx](https://github.com/xHuGODx) | `ox-astro-balanced` |
+| Hugo Ribeiro  | [@xHuGODx](https://github.com/xHuGODx) | `ox-astro-fast` |
 
 ## Build
 
@@ -21,27 +26,29 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 # Build all targets
 cmake --build build -j$(nproc)
 
-# Build a specific target
-cmake --build build --target compress_astro_balanced -j$(nproc)
+# Build a single target
+cmake --build build --target compress_astro_ratio -j$(nproc)
 ```
 
 Produces binaries in `build/`:
-- `compress_astro` / `decompress_astro`  (balanced — already working)
-
-> Ratio and fast binaries will be added as `compress_astro_ratio` / `compress_astro_fast` etc.
+- `compress_astro_ratio`    / `decompress_astro_ratio`
+- `compress_astro_balanced` / `decompress_astro_balanced`
+- `compress_astro_fast`     / `decompress_astro_fast`
 
 ## Usage
 
 ```bash
 # Compress
-./build/compress_astro <input_file> <output_file>
+./build/compress_astro_ratio <input_file> <output_file>
 
 # Decompress
-./build/decompress_astro <compressed_file> <output_file>
+./build/decompress_astro_ratio <compressed_file> <output_file>
 
 # Stdin/stdout mode
-./build/compress_astro < input_file > output_file
+./build/compress_astro_ratio < input_file > output_file
 ```
+
+The same interface applies to `_balanced` and `_fast` variants.
 
 ## Data
 
@@ -53,44 +60,59 @@ Download `data2.zip` from the Moodle "Project #02" folder and unzip it here.
 Run against `gzip`, `bzip2`, `lzma`, `xz`, and `zstd` (per-file mean over files A–H):
 
 ```bash
-# Balanced only
 ./benchmark.sh -d data2 -m -q \
-  -o "ox-astro:./build/compress_astro %i %o:./build/decompress_astro %i %o"
-
-# All three (once ratio and fast are implemented)
-./benchmark.sh -d data2 -m -q \
-  -o "ox-astro:./build/compress_astro %i %o:./build/decompress_astro %i %o" \
   -o "ox-astro-ratio:./build/compress_astro_ratio %i %o:./build/decompress_astro_ratio %i %o" \
+  -o "ox-astro-balanced:./build/compress_astro_balanced %i %o:./build/decompress_astro_balanced %i %o" \
   -o "ox-astro-fast:./build/compress_astro_fast %i %o:./build/decompress_astro_fast %i %o"
 ```
 
-### Current results (balanced baseline, per-file mean over A–H)
+### Baseline results (per-file mean over A–H, 34.33 MB total)
 
 | Rank | Compressor | bits/byte | t_comp (s) | t_decomp (s) | Lossless |
-|------|-----------|-----------|------------|--------------|----------|
-| 1 | bzip2 | 3.579 | 0.33 | 0.24 | YES |
-| **2** | **ox-astro** | **3.609** | **0.94** | **1.00** | **YES** |
-| 3 | lzma-9 | 3.684 | 1.49 | 0.17 | YES |
-| 4 | xz-6 | 3.685 | 1.48 | 0.18 | YES |
-| 5 | lzma-1 | 3.916 | 0.42 | 0.18 | YES |
-| 6 | zstd-19 | 4.156 | 1.38 | 0.02 | YES |
-| 7 | zstd-3 | 4.324 | 0.08 | 0.06 | YES |
-| 8 | gzip | 4.376 | 0.37 | 0.08 | YES |
-| 9 | zstd-1 | 4.487 | 0.05 | 0.02 | YES |
+|-----:|:-----------|----------:|-----------:|-------------:|:--------:|
+| 1 | bzip2 | 3.579 | 0.38 | 0.26 | YES |
+| **2** | **ox-astro-fast** | **3.601** | **1.16** | **1.20** | **YES** |
+| **3** | **ox-astro-ratio** | **3.609** | **1.09** | **1.24** | **YES** |
+| **4** | **ox-astro-balanced** | **3.611** | **1.09** | **1.32** | **YES** |
+| 5 | lzma-5 | 3.679 | 1.95 | 0.19 | YES |
+| 6 | lzma-9 | 3.684 | 2.09 | 0.18 | YES |
+| 7 | xz-6 | 3.685 | 2.04 | 0.18 | YES |
+| 8 | lzma-1 | 3.916 | 0.57 | 0.20 | YES |
+| 9 | zstd-19 | 4.156 | 1.89 | 0.02 | YES |
+| 10 | zstd-3 | 4.324 | 0.10 | 0.05 | YES |
+| 11 | gzip | 4.376 | 0.45 | 0.09 | YES |
+| 12 | zstd-1 | 4.487 | 0.06 | 0.02 | YES |
 
+## Algorithm
 
-## Algorithm — Balanced Variant
+All three variants share the same two-stage architecture: a **modeling stage** that predicts each pixel from its neighbours, and a **coding stage** that entropy-codes the residuals.
 
-**Pipeline:**
-1. Read raw bytes → decode as 2D array of big-endian `uint16_t`
-2. Raster-scan each pixel; predict with **JPEG-LS MED**:
-   - `W` = left, `N` = above, `NW` = above-left
-   - `pred = median-edge(W, N, NW)` — handles edges and smooth regions
-3. Compute wrapping residual: `u = pixel − pred  (mod 2¹⁶)`
-4. **Modular zigzag**: map `u` so small-magnitude values (both positive and negative) map near 0
-5. Split each 16-bit zigzag value into `hi` (upper byte) and `lo` (lower byte)
-6. Encode with adaptive range coder:
-   - `hi` → model indexed by previous `hi` byte (ORDER-1)
-   - `lo` → model indexed by current `hi` byte (strong correlation)
+### Common components
 
-**Compressed format:** `"TA2A"` magic (4 B) + width (4 B LE) + height (4 B LE) + range-coded stream.
+**Input parsing:** raw bytes decoded as big-endian `uint16_t`, stored as a 2D pixel array.
+
+**Modular zigzag:** wrapping residual `u = pixel − pred (mod 2¹⁶)` is remapped so that small-magnitude values (both positive and negative) land near 0:
+```
+z = (u ≤ 32767) ?  2·u  :  (65536−u)·2 − 1
+```
+This concentrates probability mass near 0 regardless of residual sign.
+
+**Byte split:** the 16-bit zigzag value `z` is split into `hi = z >> 8` and `lo = z & 0xFF`, encoded with separate models. For smooth astronomical backgrounds, `hi = 0x00` for 90–100% of pixels.
+
+**Compressed format:** 4-byte magic + width (4 B LE) + height (4 B LE) + range-coded stream.
+
+### Variant differences
+
+| | Predictor | hi model | lo model | Models total | Magic |
+|---|-----------|----------|----------|--------------|-------|
+| **ratio** | JPEG-LS MED | ORDER-1 (256 tables, ctx=prev hi) | ORDER-1 (256 tables, ctx=current hi) | 512 | `TA2A` |
+| **balanced** | JPEG-LS MED | ORDER-1 (256 tables, ctx=prev hi) | ORDER-0 (1 shared table) | 257 | `TA2B` |
+| **fast** | Horizontal delta (left neighbour) | ORDER-0 (1 table) | ORDER-0 (1 table) | 2 | `TA2F` |
+
+**JPEG-LS MED predictor** (`W`=left, `N`=above, `NW`=above-left):
+```
+if   NW ≥ max(W, N):  pred = min(W, N)
+elif NW ≤ min(W, N):  pred = max(W, N)
+else:                 pred = W + N − NW
+```
+Selects horizontal/vertical prediction at edges and bilinear interpolation in smooth regions.
