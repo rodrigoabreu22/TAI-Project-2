@@ -10,6 +10,25 @@ inline uint16_t med_predict(uint16_t W, uint16_t N, uint16_t NW) {
     return static_cast<uint16_t>(W + N - NW);
 }
 
+// GAP (Gradient-Adjusted Predictor) for 16-bit samples.
+// Measures horizontal activity dh and vertical activity dv using a 6-pixel
+// window. Picks the predictor from the more stable axis; falls back to MED.
+static constexpr int GAP_THRESH = 128;
+
+inline uint16_t gap_predict(uint16_t W, uint16_t WW,
+                             uint16_t N, uint16_t NN,
+                             uint16_t NW, uint16_t NE) {
+    int dh = std::abs((int)W - (int)WW)
+           + std::abs((int)N - (int)NW)
+           + std::abs((int)N - (int)NE);
+    int dv = std::abs((int)N - (int)NN)
+           + std::abs((int)W - (int)NW)
+           + std::abs((int)NE - (int)N);
+    if (dv - dh > GAP_THRESH) return W;
+    if (dh - dv > GAP_THRESH) return N;
+    return med_predict(W, N, NW);
+}
+
 // Modular zigzag: maps wrapping residual u (= pixel - pred, mod 2^16) so that
 // small magnitudes (both positive and negative) map to values near 0.
 //   0 → 0,  65535 → 1,  1 → 2,  65534 → 3,  2 → 4, ...
