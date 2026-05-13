@@ -25,6 +25,12 @@ static uint32_t read_u32le(std::istream& in) {
     return v;
 }
 
+static uint16_t read_u16le(std::istream& in) {
+    uint16_t lo = static_cast<uint8_t>(in.get());
+    uint16_t hi = static_cast<uint8_t>(in.get());
+    return static_cast<uint16_t>(lo | (hi << 8));
+}
+
 static FenwickFrequencyTable make_fenwick256() {
     FenwickFrequencyTable t(256);
     for (int i = 0; i < 256; ++i) t.increment(i);
@@ -59,9 +65,11 @@ int main(int argc, char* argv[]) {
     const uint32_t height = read_u32le(*in_ptr);
     const uint64_t npix   = static_cast<uint64_t>(width) * height;
 
+    const bool     use_mean_pred = (static_cast<uint8_t>(in_ptr->get()) == 1);
+    const uint16_t global_mean   = read_u16le(*in_ptr);
+
     std::vector<uint16_t> pixels(npix);
 
-    // All three model arrays use Fenwick for O(log 256) operations.
     std::vector<FenwickFrequencyTable> hi_models(16, make_fenwick256());
     std::vector<FenwickFrequencyTable> lo_hi0_models(32, make_fenwick256());
     std::vector<FenwickFrequencyTable> lo_hip_models(255, make_fenwick256());
@@ -85,7 +93,6 @@ int main(int argc, char* argv[]) {
     };
 
     std::vector<int> C(16, 0), B(16, 0), Nc(16, 0);
-
     std::vector<uint8_t> hi_N(width, 0);
     uint8_t prev_lo_hi0 = 0;
 
@@ -120,11 +127,17 @@ int main(int argc, char* argv[]) {
 
             uint16_t u = zigzag_decode((static_cast<uint16_t>(hi) << 8) | lo);
 
-            uint16_t pred = (row == 0 && col == 0) ? 0u : gap_predict(W, WW, N, NN, NW, NE);
+            uint16_t pred;
+            if (use_mean_pred) {
+                pred = global_mean;
+            } else {
+                pred = (row == 0 && col == 0)
+                    ? 0u
+                    : robust_gap_predict(W, WW, N, NN, NW, NE, hi_W, hi_N[col]);
+            }
             uint16_t pred_adj = static_cast<uint16_t>(static_cast<int>(pred) + C[ctx_hi]);
             pixels[row * width + col] = static_cast<uint16_t>(pred_adj + u);
 
-            // Bias correction update — identical to encoder
             int r_s = (u <= 32767u) ? static_cast<int>(u) : static_cast<int>(u) - 65536;
             B[ctx_hi] += r_s;
             Nc[ctx_hi]++;
