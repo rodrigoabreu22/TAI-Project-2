@@ -36,6 +36,7 @@
 
 #include "coder/RangeCoder.hpp"
 #include "coder/FrequencyTable.hpp"
+#include "coder/FastFrequencyTable.hpp"
 #include "coder/MixedFrequencyTable.hpp"
 #include "model/ImagePredictor.hpp"
 
@@ -48,9 +49,7 @@ static void write_u32le(std::ostream& out, uint32_t v) {
     out.put(static_cast<char>((v >> 24) & 0xFF));
 }
 
-static SimpleFrequencyTable make_flat256() {
-    return SimpleFrequencyTable(std::vector<uint32_t>(256, 1u));
-}
+static FastFrequencyTable make_flat256() { return FastFrequencyTable{}; }
 
 // Map lo byte to one of 8 log-scale bins for ORDER-1 lo context.
 static int quantize_prev_lo(uint8_t lo) {
@@ -137,8 +136,8 @@ int main(int argc, char* argv[]) {
     static constexpr int    LO_HI0_TOTAL     = LO_HI0_CLASSES * LO_HI0_PREV_BINS;
     static constexpr uint32_t HI_PRIOR_CAP   = 1024;  // keeps class priors bounded
 
-    std::vector<SimpleFrequencyTable> hi_models, hi_class_priors,
-                                      lo_hi0_models, lo_hip_models;
+    std::vector<FastFrequencyTable> hi_models, hi_class_priors,
+                                    lo_hi0_models, lo_hip_models;
     hi_models.reserve(NUM_CONTEXTS);
     for (int i = 0; i < NUM_CONTEXTS; ++i)
         hi_models.push_back(make_flat256());

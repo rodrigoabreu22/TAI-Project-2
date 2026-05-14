@@ -32,7 +32,7 @@
 set -euo pipefail
 
 # ---------- defaults ---------------------------------------------------------
-DATA_DIR="data"
+DATA_DIR="data2"
 FILES_ARG="A,B,C,D,E,F,G,H"
 CONCAT_MODE=false
 MULTI_MODE=false
