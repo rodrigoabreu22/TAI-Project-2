@@ -16,6 +16,7 @@
 
 #include "coder/RangeCoder.hpp"
 #include "coder/FrequencyTable.hpp"
+#include "coder/MixedFrequencyTable.hpp"
 #include "model/ImagePredictor.hpp"
 
 static constexpr uint8_t MAGIC[4] = {'T','A','2','A'};
@@ -76,13 +77,19 @@ int main(int argc, char* argv[]) {
 
     std::vector<uint16_t> pixels(npix);
 
-    static constexpr int LO_HI0_CLASSES   = 4;
-    static constexpr int LO_HI0_PREV_BINS = 8;
-    static constexpr int LO_HI0_TOTAL     = LO_HI0_CLASSES * LO_HI0_PREV_BINS;
-    std::vector<SimpleFrequencyTable> hi_models, lo_hi0_models, lo_hip_models;
+    static constexpr int      LO_HI0_CLASSES   = 4;
+    static constexpr int      LO_HI0_PREV_BINS = 8;
+    static constexpr int      LO_HI0_TOTAL     = LO_HI0_CLASSES * LO_HI0_PREV_BINS;
+    static constexpr uint32_t HI_PRIOR_CAP     = 1024;
+
+    std::vector<SimpleFrequencyTable> hi_models, hi_class_priors,
+                                      lo_hi0_models, lo_hip_models;
     hi_models.reserve(NUM_CONTEXTS);
     for (int i = 0; i < NUM_CONTEXTS; ++i)
         hi_models.push_back(make_flat256());
+    hi_class_priors.reserve(LO_HI0_CLASSES);
+    for (int i = 0; i < LO_HI0_CLASSES; ++i)
+        hi_class_priors.push_back(make_flat256());
     lo_hi0_models.reserve(LO_HI0_TOTAL);
     for (int i = 0; i < LO_HI0_TOTAL; ++i)
         lo_hi0_models.push_back(make_flat256());
@@ -123,8 +130,16 @@ int main(int argc, char* argv[]) {
                              (grad_max < GRAD_T3) ? 2 : 3;
             }
 
-            uint8_t hi = static_cast<uint8_t>(dec.read(hi_models[ctx]));
+            MixedFrequencyTable mixed_hi(hi_models[ctx], hi_class_priors[lo_hi0_ctx]);
+            uint8_t hi = static_cast<uint8_t>(dec.read(mixed_hi));
             hi_models[ctx].increment(hi);
+            hi_class_priors[lo_hi0_ctx].increment(hi);
+            if (hi_class_priors[lo_hi0_ctx].getTotal() > HI_PRIOR_CAP) {
+                for (uint32_t s = 0; s < 256; ++s) {
+                    hi_class_priors[lo_hi0_ctx].set(
+                        s, std::max(1u, hi_class_priors[lo_hi0_ctx].get(s) >> 1));
+                }
+            }
 
             uint8_t lo;
             if (hi == 0) {

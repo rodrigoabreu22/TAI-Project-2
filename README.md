@@ -3,11 +3,11 @@
 
 Data-specific lossless compressor for raw astronomical images. Input is a raw raster of **1500×1500 unsigned 16-bit integers (big-endian)**. Three independent compressors are provided, each targeting a different trade-off between compression ratio and speed.
 
-| Tool | Strategy | bits/byte (baseline) |
-|------|----------|---------------------|
-| `ox-astro-ratio`    | JPEG-LS MED + ORDER-1 hi + ORDER-1(hi) lo | 3.609 |
-| `ox-astro-balanced` | JPEG-LS MED + ORDER-1 hi + ORDER-0 lo     | 3.611 |
-| `ox-astro-fast`     | Horizontal delta + ORDER-0                | 3.601 |
+| Tool | Strategy | bits/byte |
+|------|----------|-----------|
+| `ox-astro-ratio`    | JPEG-LS MED + 365-context spatial model + context mixing + bias correction | **3.497** |
+| `ox-astro-balanced` | JPEG-LS MED + ORDER-1 hi + ORDER-0 lo | 3.611 |
+| `ox-astro-fast`     | Horizontal delta + ORDER-0 | 3.601 |
 
 ## Authors
 
@@ -66,22 +66,22 @@ Run against `gzip`, `bzip2`, `lzma`, `xz`, and `zstd` (per-file mean over files 
   -o "ox-astro-fast:./build/compress_astro_fast %i %o:./build/decompress_astro_fast %i %o"
 ```
 
-### Baseline results (per-file mean over A–H, 34.33 MB total)
+### Current results (per-file mean over A–H, 34.33 MB total)
 
 | Rank | Compressor | bits/byte | t_comp (s) | t_decomp (s) | Lossless |
 |-----:|:-----------|----------:|-----------:|-------------:|:--------:|
-| 1 | bzip2 | 3.579 | 0.38 | 0.26 | YES |
-| **2** | **ox-astro-fast** | **3.601** | **1.16** | **1.20** | **YES** |
-| **3** | **ox-astro-ratio** | **3.609** | **1.09** | **1.24** | **YES** |
-| **4** | **ox-astro-balanced** | **3.611** | **1.09** | **1.32** | **YES** |
-| 5 | lzma-5 | 3.679 | 1.95 | 0.19 | YES |
-| 6 | lzma-9 | 3.684 | 2.09 | 0.18 | YES |
-| 7 | xz-6 | 3.685 | 2.04 | 0.18 | YES |
-| 8 | lzma-1 | 3.916 | 0.57 | 0.20 | YES |
-| 9 | zstd-19 | 4.156 | 1.89 | 0.02 | YES |
-| 10 | zstd-3 | 4.324 | 0.10 | 0.05 | YES |
-| 11 | gzip | 4.376 | 0.45 | 0.09 | YES |
-| 12 | zstd-1 | 4.487 | 0.06 | 0.02 | YES |
+| **1** | **ox-astro-ratio** | **3.497** | **1.55** | **1.78** | **YES** |
+| 2 | bzip2 | 3.579 | 0.39 | 0.20 | YES |
+| **3** | **ox-astro-fast** | **3.601** | **0.98** | **1.05** | **YES** |
+| **4** | **ox-astro-balanced** | **3.611** | **0.99** | **1.17** | **YES** |
+| 5 | lzma-5 | 3.679 | 1.63 | 0.14 | YES |
+| 6 | lzma-9 | 3.684 | 1.63 | 0.18 | YES |
+| 7 | xz-6 | 3.685 | 1.52 | 0.16 | YES |
+| 8 | lzma-1 | 3.916 | 0.45 | 0.17 | YES |
+| 9 | zstd-19 | 4.156 | 1.34 | 0.03 | YES |
+| 10 | zstd-3 | 4.324 | 0.07 | 0.03 | YES |
+| 11 | gzip | 4.376 | 0.38 | 0.06 | YES |
+| 12 | zstd-1 | 4.487 | 0.04 | 0.02 | YES |
 
 ## Algorithm
 
@@ -105,7 +105,7 @@ This concentrates probability mass near 0 regardless of residual sign.
 
 | | Predictor | hi model | lo model | Models total | Magic |
 |---|-----------|----------|----------|--------------|-------|
-| **ratio** | JPEG-LS MED | ORDER-1 (256 tables, ctx=prev hi) | ORDER-1 (256 tables, ctx=current hi) | 512 | `TA2A` |
+| **ratio** | JPEG-LS MED + bias correction | 365 spatial contexts + 4 class priors (context mixing) | 32 tables (hi=0, grad_class×prev_lo_bin) + 255 tables (hi>0) | 656 | `TA2A` |
 | **balanced** | JPEG-LS MED | ORDER-1 (256 tables, ctx=prev hi) | ORDER-0 (1 shared table) | 257 | `TA2B` |
 | **fast** | Horizontal delta (left neighbour) | ORDER-0 (1 table) | ORDER-0 (1 table) | 2 | `TA2F` |
 

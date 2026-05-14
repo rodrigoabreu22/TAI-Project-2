@@ -36,6 +36,7 @@
 
 #include "coder/RangeCoder.hpp"
 #include "coder/FrequencyTable.hpp"
+#include "coder/MixedFrequencyTable.hpp"
 #include "model/ImagePredictor.hpp"
 
 static constexpr uint8_t MAGIC[4] = {'T','A','2','A'};
@@ -116,7 +117,14 @@ int main(int argc, char* argv[]) {
     write_u32le(*out_ptr, width);
     write_u32le(*out_ptr, height);
 
-    // hi models    : 365 × 256-symbol, indexed by spatial context.
+    // hi models        : 365 × 256-symbol fine per-context adaptive models.
+    // hi_class_priors  : 4 × 256-symbol class-level priors (flat/slight/moderate/strong).
+    //   Each prior is a bounded running summary of hi statistics for its gradient
+    //   class, capped at HI_PRIOR_CAP total counts by periodic halving.
+    //   At encode time hi is coded via MixedFrequencyTable(fine, class_prior):
+    //     • Sparse fine context  (few visits): class prior dominates → correct prior
+    //     • Dense  fine context  (many visits): fine model dominates → no dilution
+    //   This is context mixing: Strategy A.
     // lo_hi0_models: 32 × 256-symbol, indexed by (grad_class × 8 + prev_lo_bin).
     //   grad_class  [0-3]: coarse gradient magnitude (flat/slight/moderate/strong).
     //   prev_lo_bin [0-7]: log-scale quantisation of the previous hi=0 lo byte.
@@ -124,13 +132,19 @@ int main(int argc, char* argv[]) {
     //   residuals: if the last small-residual pixel had lo≈5, the current one
     //   is likely also near 5. 32 tables keep each well-populated (~56K samples).
     // lo_hip_models: 255 × 256-symbol, indexed by (hi-1) for hi in [1,255].
-    static constexpr int LO_HI0_CLASSES  = 4;
-    static constexpr int LO_HI0_PREV_BINS = 8;
-    static constexpr int LO_HI0_TOTAL    = LO_HI0_CLASSES * LO_HI0_PREV_BINS;  // 32
-    std::vector<SimpleFrequencyTable> hi_models, lo_hi0_models, lo_hip_models;
+    static constexpr int    LO_HI0_CLASSES   = 4;
+    static constexpr int    LO_HI0_PREV_BINS = 8;
+    static constexpr int    LO_HI0_TOTAL     = LO_HI0_CLASSES * LO_HI0_PREV_BINS;
+    static constexpr uint32_t HI_PRIOR_CAP   = 1024;  // keeps class priors bounded
+
+    std::vector<SimpleFrequencyTable> hi_models, hi_class_priors,
+                                      lo_hi0_models, lo_hip_models;
     hi_models.reserve(NUM_CONTEXTS);
     for (int i = 0; i < NUM_CONTEXTS; ++i)
         hi_models.push_back(make_flat256());
+    hi_class_priors.reserve(LO_HI0_CLASSES);
+    for (int i = 0; i < LO_HI0_CLASSES; ++i)
+        hi_class_priors.push_back(make_flat256());
     lo_hi0_models.reserve(LO_HI0_TOTAL);
     for (int i = 0; i < LO_HI0_TOTAL; ++i)
         lo_hi0_models.push_back(make_flat256());
@@ -190,8 +204,22 @@ int main(int argc, char* argv[]) {
             uint8_t  hi = static_cast<uint8_t>(z >> 8);
             uint8_t  lo = static_cast<uint8_t>(z & 0xFF);
 
-            enc.write(hi_models[ctx], hi);
+            // Context mixing: blend fine spatial model with class-level prior.
+            // The prior converges fast (sees all pixels in its class) and provides
+            // a good distribution for fine contexts that have been visited rarely.
+            {
+                MixedFrequencyTable mixed(hi_models[ctx], hi_class_priors[lo_hi0_ctx]);
+                enc.write(mixed, hi);
+            }
             hi_models[ctx].increment(hi);
+            hi_class_priors[lo_hi0_ctx].increment(hi);
+            // Cap class prior total to stay bounded and avoid diluting fine models.
+            if (hi_class_priors[lo_hi0_ctx].getTotal() > HI_PRIOR_CAP) {
+                for (uint32_t s = 0; s < 256; ++s) {
+                    hi_class_priors[lo_hi0_ctx].set(
+                        s, std::max(1u, hi_class_priors[lo_hi0_ctx].get(s) >> 1));
+                }
+            }
 
             if (hi == 0) {
                 int lo_idx = lo_hi0_ctx * LO_HI0_PREV_BINS
