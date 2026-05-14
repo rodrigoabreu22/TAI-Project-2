@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <sstream>
+#include <thread>
 #include <vector>
 
 #include "coder/RangeCoder.hpp"
@@ -68,12 +70,18 @@ int main(int argc, char* argv[]) {
     const bool     use_mean_pred = (static_cast<uint8_t>(in_ptr->get()) == 1);
     const uint16_t global_mean   = read_u16le(*in_ptr);
 
-    std::vector<uint16_t> pixels(npix);
+    const unsigned ntiles = static_cast<uint8_t>(in_ptr->get());
+    std::vector<uint32_t> tile_sizes(ntiles);
+    for (unsigned t = 0; t < ntiles; ++t)
+        tile_sizes[t] = read_u32le(*in_ptr);
 
-    std::vector<FenwickFrequencyTable> hi_models(16, make_fenwick256());
-    std::vector<FenwickFrequencyTable> lo_hi0_models(32, make_fenwick256());
-    std::vector<FenwickFrequencyTable> lo_hip_models(255, make_fenwick256());
+    std::vector<std::string> tile_data(ntiles);
+    for (unsigned t = 0; t < ntiles; ++t) {
+        tile_data[t].resize(tile_sizes[t]);
+        in_ptr->read(tile_data[t].data(), tile_sizes[t]);
+    }
 
+    // ── Quantizers ─────────────────────────────────────────────────────────
     auto quantize = [](uint8_t h) -> int {
         if (h == 0) return 0;
         if (h <= 2) return 1;
@@ -92,70 +100,88 @@ int main(int argc, char* argv[]) {
         return 7;
     };
 
-    std::vector<int> C(16, 0), B(16, 0), Nc(16, 0);
-    std::vector<uint8_t> hi_N(width, 0);
-    uint8_t prev_lo_hi0 = 0;
+    // ── Tile-parallel decoding ─────────────────────────────────────────────
+    std::vector<uint16_t> pixels(npix);
+    std::vector<std::thread> threads(ntiles);
 
-    RangeDecoder dec(*in_ptr);
+    for (unsigned t = 0; t < ntiles; ++t) {
+        threads[t] = std::thread([&, t]() {
+            const uint32_t row_start = static_cast<uint32_t>(height * t / ntiles);
+            const uint32_t row_end   = static_cast<uint32_t>(height * (t + 1) / ntiles);
 
-    for (uint32_t row = 0; row < height; ++row) {
-        uint8_t hi_W = 0;
-        for (uint32_t col = 0; col < width; ++col) {
-            uint16_t W  = (col > 0)                    ? pixels[row * width + col - 1]             : 0u;
-            uint16_t WW = (col > 1)                    ? pixels[row * width + col - 2]             : W;
-            uint16_t N  = (row > 0)                    ? pixels[(row-1) * width + col]             : W;
-            uint16_t NN = (row > 1)                    ? pixels[(row-2) * width + col]             : N;
-            uint16_t NW = (row > 0 && col > 0)         ? pixels[(row-1) * width + col - 1]         : W;
-            uint16_t NE = (row > 0 && col < width - 1) ? pixels[(row-1) * width + col + 1]         : N;
+            std::istringstream iss(tile_data[t], std::ios::binary);
+            std::vector<FenwickFrequencyTable> hi_models(16, make_fenwick256());
+            std::vector<FenwickFrequencyTable> lo_hi0_models(32, make_fenwick256());
+            std::vector<FenwickFrequencyTable> lo_hip_models(255, make_fenwick256());
+            std::vector<int> C(16, 0), B(16, 0), Nc(16, 0);
+            std::vector<uint8_t> hi_N(width, 0);
+            uint8_t prev_lo_hi0 = 0;
 
-            uint8_t ctx_hi = static_cast<uint8_t>(quantize(hi_W) * 4 + quantize(hi_N[col]));
+            RangeDecoder dec(iss);
 
-            uint8_t hi = static_cast<uint8_t>(dec.read(hi_models[ctx_hi]));
-            hi_models[ctx_hi].increment(hi);
+            for (uint32_t row = row_start; row < row_end; ++row) {
+                const uint32_t local_row = row - row_start;
+                uint8_t hi_W = 0;
+                for (uint32_t col = 0; col < width; ++col) {
+                    uint8_t ctx_hi = static_cast<uint8_t>(quantize(hi_W) * 4 + quantize(hi_N[col]));
 
-            uint8_t lo;
-            if (hi == 0) {
-                int grad_class = std::min(quantize(hi_W) + quantize(hi_N[col]), 3);
-                int lo_idx = grad_class * 8 + quantize_prev_lo(prev_lo_hi0);
-                lo = static_cast<uint8_t>(dec.read(lo_hi0_models[lo_idx]));
-                lo_hi0_models[lo_idx].increment(lo);
-                prev_lo_hi0 = lo;
-            } else {
-                lo = static_cast<uint8_t>(dec.read(lo_hip_models[hi - 1]));
-                lo_hip_models[hi - 1].increment(lo);
+                    uint8_t hi = static_cast<uint8_t>(dec.read(hi_models[ctx_hi]));
+                    hi_models[ctx_hi].increment(hi);
+
+                    uint8_t lo;
+                    if (hi == 0) {
+                        int grad_class = std::min(quantize(hi_W) + quantize(hi_N[col]), 3);
+                        int lo_idx = grad_class * 8 + quantize_prev_lo(prev_lo_hi0);
+                        lo = static_cast<uint8_t>(dec.read(lo_hi0_models[lo_idx]));
+                        lo_hi0_models[lo_idx].increment(lo);
+                        prev_lo_hi0 = lo;
+                    } else {
+                        lo = static_cast<uint8_t>(dec.read(lo_hip_models[hi - 1]));
+                        lo_hip_models[hi - 1].increment(lo);
+                    }
+
+                    uint16_t u = zigzag_decode((static_cast<uint16_t>(hi) << 8) | lo);
+
+                    uint16_t W  = (col > 0)                         ? pixels[row * width + col - 1]         : 0u;
+                    uint16_t WW = (col > 1)                         ? pixels[row * width + col - 2]         : W;
+                    uint16_t N  = (local_row > 0)                   ? pixels[(row-1) * width + col]         : W;
+                    uint16_t NN = (local_row > 1)                   ? pixels[(row-2) * width + col]         : N;
+                    uint16_t NW = (local_row > 0 && col > 0)        ? pixels[(row-1) * width + col - 1]     : W;
+                    uint16_t NE = (local_row > 0 && col < width-1)  ? pixels[(row-1) * width + col + 1]     : N;
+
+                    uint16_t pred;
+                    if (use_mean_pred) {
+                        pred = global_mean;
+                    } else {
+                        pred = (local_row == 0 && col == 0)
+                            ? 0u
+                            : robust_gap_predict(W, WW, N, NN, NW, NE, hi_W, hi_N[col]);
+                    }
+                    uint16_t pred_adj = static_cast<uint16_t>(static_cast<int>(pred) + C[ctx_hi]);
+                    pixels[row * width + col] = static_cast<uint16_t>(pred_adj + u);
+
+                    int r_s = (u <= 32767u) ? static_cast<int>(u) : static_cast<int>(u) - 65536;
+                    B[ctx_hi] += r_s;
+                    Nc[ctx_hi]++;
+                    if (B[ctx_hi] > Nc[ctx_hi]) {
+                        C[ctx_hi]++;
+                        B[ctx_hi] -= Nc[ctx_hi];
+                        if (B[ctx_hi] > Nc[ctx_hi]) B[ctx_hi] = Nc[ctx_hi];
+                    } else if (B[ctx_hi] < -Nc[ctx_hi]) {
+                        C[ctx_hi]--;
+                        B[ctx_hi] += Nc[ctx_hi];
+                        if (B[ctx_hi] < -Nc[ctx_hi]) B[ctx_hi] = -Nc[ctx_hi];
+                    }
+                    if (Nc[ctx_hi] == 512) { Nc[ctx_hi] >>= 1; B[ctx_hi] >>= 1; }
+
+                    hi_W      = hi;
+                    hi_N[col] = hi;
+                }
             }
-
-            uint16_t u = zigzag_decode((static_cast<uint16_t>(hi) << 8) | lo);
-
-            uint16_t pred;
-            if (use_mean_pred) {
-                pred = global_mean;
-            } else {
-                pred = (row == 0 && col == 0)
-                    ? 0u
-                    : robust_gap_predict(W, WW, N, NN, NW, NE, hi_W, hi_N[col]);
-            }
-            uint16_t pred_adj = static_cast<uint16_t>(static_cast<int>(pred) + C[ctx_hi]);
-            pixels[row * width + col] = static_cast<uint16_t>(pred_adj + u);
-
-            int r_s = (u <= 32767u) ? static_cast<int>(u) : static_cast<int>(u) - 65536;
-            B[ctx_hi] += r_s;
-            Nc[ctx_hi]++;
-            if (B[ctx_hi] > Nc[ctx_hi]) {
-                C[ctx_hi]++;
-                B[ctx_hi] -= Nc[ctx_hi];
-                if (B[ctx_hi] > Nc[ctx_hi]) B[ctx_hi] = Nc[ctx_hi];
-            } else if (B[ctx_hi] < -Nc[ctx_hi]) {
-                C[ctx_hi]--;
-                B[ctx_hi] += Nc[ctx_hi];
-                if (B[ctx_hi] < -Nc[ctx_hi]) B[ctx_hi] = -Nc[ctx_hi];
-            }
-            if (Nc[ctx_hi] == 512) { Nc[ctx_hi] >>= 1; B[ctx_hi] >>= 1; }
-
-            hi_W      = hi;
-            hi_N[col] = hi;
-        }
+        });
     }
+
+    for (auto& th : threads) th.join();
 
     std::vector<uint8_t> out_bytes(npix * 2);
     for (uint64_t i = 0; i < npix; ++i) {
