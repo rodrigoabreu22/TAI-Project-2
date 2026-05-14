@@ -5,6 +5,7 @@
  *         decompress_astro_balanced          (stdin → stdout)
  */
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -33,9 +34,10 @@ static uint16_t read_u16le(std::istream& in) {
     return static_cast<uint16_t>(lo | (hi << 8));
 }
 
-static FenwickFrequencyTable make_fenwick256() {
+static FenwickFrequencyTable make_fenwick_from_hist(const std::array<uint8_t,256>& hist) {
     FenwickFrequencyTable t(256);
-    for (int i = 0; i < 256; ++i) t.increment(i);
+    for (int i = 0; i < 256; ++i)
+        t.set(i, hist[i]);
     return t;
 }
 
@@ -69,6 +71,12 @@ int main(int argc, char* argv[]) {
 
     const bool     use_mean_pred = (static_cast<uint8_t>(in_ptr->get()) == 1);
     const uint16_t global_mean   = read_u16le(*in_ptr);
+
+    // Read warm-model histograms written by the encoder.
+    std::array<uint8_t,256> hi_hist{}, lo_hi0hist{}, lo_hiphist{};
+    in_ptr->read(reinterpret_cast<char*>(hi_hist.data()),    256);
+    in_ptr->read(reinterpret_cast<char*>(lo_hi0hist.data()), 256);
+    in_ptr->read(reinterpret_cast<char*>(lo_hiphist.data()), 256);
 
     const unsigned ntiles = static_cast<uint8_t>(in_ptr->get());
     std::vector<uint32_t> tile_sizes(ntiles);
@@ -110,9 +118,12 @@ int main(int argc, char* argv[]) {
             const uint32_t row_end   = static_cast<uint32_t>(height * (t + 1) / ntiles);
 
             std::istringstream iss(tile_data[t], std::ios::binary);
-            std::vector<FenwickFrequencyTable> hi_models(16, make_fenwick256());
-            std::vector<FenwickFrequencyTable> lo_hi0_models(32, make_fenwick256());
-            std::vector<FenwickFrequencyTable> lo_hip_models(255, make_fenwick256());
+
+            // Warm-start all models from the same histograms used by the encoder.
+            std::vector<FenwickFrequencyTable> hi_models(16, make_fenwick_from_hist(hi_hist));
+            std::vector<FenwickFrequencyTable> lo_hi0_models(32, make_fenwick_from_hist(lo_hi0hist));
+            std::vector<FenwickFrequencyTable> lo_hip_models(255, make_fenwick_from_hist(lo_hiphist));
+
             std::vector<int> C(16, 0), B(16, 0), Nc(16, 0);
             std::vector<uint8_t> hi_N(width, 0);
             uint8_t prev_lo_hi0 = 0;

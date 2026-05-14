@@ -6,8 +6,6 @@
  *   2. Adaptive predictor selection (entropy scan over full image):
  *        Accumulate 6 × 256-bucket histograms (hi/lo × gap/mean × hi0/hip).
  *        Estimate marginal entropy for each predictor; pick the lower one.
- *        Handles bimodal residual distributions (dark sky + saturated stars)
- *        that fool MAE-based selection.
  *   3. Wrapping residual → modular zigzag → hi/lo byte split.
  *   4. Per-context bias correction (16 contexts, LOCO-I style).
  *   5. Encode hi with spatial context: quantize(hi_W)*4 + quantize(hi_N).
@@ -15,8 +13,10 @@
  *        hi == 0 : model[(grad_class)*8 + quantize_prev_lo]  (32 models)
  *        hi  > 0 : model[hi - 1]                             (255 models)
  *   7. Tile-parallel: image split into ntiles horizontal strips
- *        (ntiles = min(8, hardware_concurrency)), each encoded independently
- *        in its own thread with fully private model state.
+ *        (ntiles = min(8, hardware_concurrency)), each encoded in its own
+ *        thread with fully private model state.
+ *      Each tile's models are warm-started from global marginal histograms
+ *        (stored in header) so tile boundaries incur minimal cold-start cost.
  *
  * Compressed file format
  * ──────────────────────
@@ -25,14 +25,18 @@
  *  Bytes  8–11 : height         uint32_t LE
  *  Byte     12 : pred_mode      0=robust-GAP  1=global-mean
  *  Bytes 13–14 : global_mean    uint16_t LE  (used when pred_mode==1)
- *  Byte     15 : ntiles         uint8_t
- *  Bytes 16..  : tile_sizes[ntiles]  uint32_t LE each
+ *  Bytes 15–270  : hi_hist[256]      uint8_t (scaled marginal hi distribution)
+ *  Bytes 271–526 : lo_hi0_hist[256]  uint8_t (scaled lo|hi=0 distribution)
+ *  Bytes 527–782 : lo_hip_hist[256]  uint8_t (scaled lo|hi>0 distribution)
+ *  Byte    783 : ntiles         uint8_t
+ *  Bytes 784.. : tile_sizes[ntiles]  uint32_t LE each
  *  Then        : tile bitstreams concatenated
  *
  * Usage:  compress_astro_balanced <input_file> <output_file>
  *         compress_astro_balanced          (stdin → stdout)
  */
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -62,9 +66,22 @@ static void write_u16le(std::ostream& out, uint16_t v) {
     out.put(static_cast<char>((v >> 8) & 0xFF));
 }
 
-static FenwickFrequencyTable make_fenwick256() {
+// Scale a histogram to uint8_t counts in [1, 128], max maps to 128.
+static std::array<uint8_t,256> scale_hist(const std::array<uint64_t,256>& cnt) {
+    std::array<uint8_t,256> out{};
+    uint64_t max_cnt = *std::max_element(cnt.begin(), cnt.end());
+    for (int i = 0; i < 256; ++i) {
+        uint64_t s = (max_cnt > 0) ? (cnt[i] * 127u / max_cnt) : 0u;
+        out[i] = static_cast<uint8_t>(s + 1u);  // [1, 128]
+    }
+    return out;
+}
+
+// Initialize a FenwickFrequencyTable from a pre-scaled histogram.
+static FenwickFrequencyTable make_fenwick_from_hist(const std::array<uint8_t,256>& hist) {
     FenwickFrequencyTable t(256);
-    for (int i = 0; i < 256; ++i) t.increment(i);
+    for (int i = 0; i < 256; ++i)
+        t.set(i, hist[i]);
     return t;
 }
 
@@ -168,6 +185,15 @@ int main(int argc, char* argv[]) {
     const double est_mean = est_entropy(hi_cnt_mean, lo_hi0_cnt_mean, lo_hip_cnt_mean);
     const bool use_mean_pred = (est_mean < est_gap);
 
+    // Scale the selected predictor's histograms for warm-model initialisation.
+    const auto& hi_cnt    = use_mean_pred ? hi_cnt_mean    : hi_cnt_gap;
+    const auto& lo_hi0cnt = use_mean_pred ? lo_hi0_cnt_mean : lo_hi0_cnt_gap;
+    const auto& lo_hipcnt = use_mean_pred ? lo_hip_cnt_mean : lo_hip_cnt_gap;
+
+    const auto hi_hist    = scale_hist(hi_cnt);
+    const auto lo_hi0hist = scale_hist(lo_hi0cnt);
+    const auto lo_hiphist = scale_hist(lo_hipcnt);
+
     // ── Quantizers (shared across tiles) ──────────────────────────────────
     auto quantize = [](uint8_t h) -> int {
         if (h == 0) return 0;
@@ -198,9 +224,12 @@ int main(int argc, char* argv[]) {
             const uint32_t row_end   = static_cast<uint32_t>(height * (t + 1) / ntiles);
 
             std::ostringstream oss;
-            std::vector<FenwickFrequencyTable> hi_models(16, make_fenwick256());
-            std::vector<FenwickFrequencyTable> lo_hi0_models(32, make_fenwick256());
-            std::vector<FenwickFrequencyTable> lo_hip_models(255, make_fenwick256());
+
+            // Warm-start all models from global marginal histograms.
+            std::vector<FenwickFrequencyTable> hi_models(16, make_fenwick_from_hist(hi_hist));
+            std::vector<FenwickFrequencyTable> lo_hi0_models(32, make_fenwick_from_hist(lo_hi0hist));
+            std::vector<FenwickFrequencyTable> lo_hip_models(255, make_fenwick_from_hist(lo_hiphist));
+
             std::vector<int> C(16, 0), B(16, 0), Nc(16, 0);
             std::vector<uint8_t> hi_N(width, 0);
             uint8_t prev_lo_hi0 = 0;
@@ -277,12 +306,15 @@ int main(int argc, char* argv[]) {
 
     for (auto& th : threads) th.join();
 
-    // ── Header + tile index + bitstreams ───────────────────────────────────
+    // ── Header + warm-model histograms + tile index + bitstreams ──────────
     out_ptr->write(reinterpret_cast<const char*>(MAGIC), 4);
     write_u32le(*out_ptr, width);
     write_u32le(*out_ptr, height);
     out_ptr->put(static_cast<char>(use_mean_pred ? 1 : 0));
     write_u16le(*out_ptr, global_mean);
+    out_ptr->write(reinterpret_cast<const char*>(hi_hist.data()),    256);
+    out_ptr->write(reinterpret_cast<const char*>(lo_hi0hist.data()), 256);
+    out_ptr->write(reinterpret_cast<const char*>(lo_hiphist.data()), 256);
     out_ptr->put(static_cast<char>(static_cast<uint8_t>(ntiles)));
     for (unsigned t = 0; t < ntiles; ++t)
         write_u32le(*out_ptr, static_cast<uint32_t>(tile_bufs[t].size()));
