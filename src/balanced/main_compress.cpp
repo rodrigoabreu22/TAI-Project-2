@@ -28,6 +28,7 @@
  *         compress_astro_balanced          (stdin → stdout)
  */
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -100,14 +101,20 @@ int main(int argc, char* argv[]) {
         pixels[i] = (static_cast<uint16_t>(raw[2*i]) << 8) | raw[2*i+1];
 
     // ── Adaptive predictor selection ───────────────────────────────────────
-    // Scan full image comparing MAE of spatial (GAP) vs zero-order (mean)
-    // predictor. For weakly-correlated images, neighbour-based prediction
-    // amplifies noise and increases residual entropy; the global mean wins.
+    // Scan full image and estimate the marginal entropy of residuals after
+    // zigzag + hi/lo split for both GAP and global-mean predictors.
+    // Selects whichever predictor produces lower estimated entropy.
+    // This is more accurate than MAE comparison: an image with bright saturated
+    // stars has low GAP-MAE (smooth background is easy) but high GAP-entropy
+    // (huge residuals near stars create a bimodal distribution).
     uint64_t px_sum = 0;
     for (uint64_t i = 0; i < npix; ++i) px_sum += pixels[i];
     const uint16_t global_mean = static_cast<uint16_t>(px_sum / npix);
 
-    uint64_t mae_gap_acc = 0, mae_mean_acc = 0;
+    std::array<uint64_t, 256> hi_cnt_gap{},    hi_cnt_mean{};
+    std::array<uint64_t, 256> lo_hi0_cnt_gap{}, lo_hi0_cnt_mean{};
+    std::array<uint64_t, 256> lo_hip_cnt_gap{}, lo_hip_cnt_mean{};
+
     for (uint32_t row = 0; row < height; ++row) {
         for (uint32_t col = 0; col < width; ++col) {
             uint16_t px = pixels[row * width + col];
@@ -118,15 +125,53 @@ int main(int argc, char* argv[]) {
             uint16_t NW = (row > 0 && col > 0)         ? pixels[(row-1) * width + col - 1]         : W;
             uint16_t NE = (row > 0 && col < width - 1) ? pixels[(row-1) * width + col + 1]         : N;
 
+            // GAP residual
             uint16_t pg = (row == 0 && col == 0) ? 0u : gap_predict(W, WW, N, NN, NW, NE);
-            uint16_t ug = static_cast<uint16_t>(static_cast<int>(px) - static_cast<int>(pg));
-            uint16_t um = static_cast<uint16_t>(static_cast<int>(px) - static_cast<int>(global_mean));
-            mae_gap_acc  += (ug <= 32768u) ? ug : static_cast<uint16_t>(65536u - ug);
-            mae_mean_acc += (um <= 32768u) ? um : static_cast<uint16_t>(65536u - um);
+            uint16_t zg = zigzag_encode(static_cast<uint16_t>(static_cast<int>(px) - static_cast<int>(pg)));
+            uint8_t hig = static_cast<uint8_t>(zg >> 8);
+            uint8_t log_ = static_cast<uint8_t>(zg & 0xFF);
+            hi_cnt_gap[hig]++;
+            if (hig == 0) lo_hi0_cnt_gap[log_]++; else lo_hip_cnt_gap[log_]++;
+
+            // Mean residual
+            uint16_t zm = zigzag_encode(static_cast<uint16_t>(static_cast<int>(px) - static_cast<int>(global_mean)));
+            uint8_t him = static_cast<uint8_t>(zm >> 8);
+            uint8_t lom = static_cast<uint8_t>(zm & 0xFF);
+            hi_cnt_mean[him]++;
+            if (him == 0) lo_hi0_cnt_mean[lom]++; else lo_hip_cnt_mean[lom]++;
         }
     }
-    // Use mean predictor when it has strictly lower MAE than GAP
-    const bool use_mean_pred = (mae_mean_acc < mae_gap_acc);
+
+    // Compute Shannon entropy from a histogram
+    auto entropy = [](const std::array<uint64_t, 256>& cnt) -> double {
+        uint64_t total = 0;
+        for (auto c : cnt) total += c;
+        if (total == 0) return 0.0;
+        double h = 0.0;
+        const double inv = 1.0 / static_cast<double>(total);
+        for (auto c : cnt) {
+            if (c > 0) {
+                double p = static_cast<double>(c) * inv;
+                h -= p * std::log2(p);
+            }
+        }
+        return h;
+    };
+
+    // Marginal entropy estimate: H(hi) + frac_hi0 * H(lo|hi=0) + frac_hip * H(lo|hi>0)
+    auto est_entropy = [&](const std::array<uint64_t,256>& hc,
+                           const std::array<uint64_t,256>& lc0,
+                           const std::array<uint64_t,256>& lcp) -> double {
+        uint64_t n_hi0 = 0; for (auto c : lc0) n_hi0 += c;
+        double frac0 = static_cast<double>(n_hi0) / static_cast<double>(npix);
+        return entropy(hc) + frac0 * entropy(lc0) + (1.0 - frac0) * entropy(lcp);
+    };
+
+    const double est_gap  = est_entropy(hi_cnt_gap,  lo_hi0_cnt_gap,  lo_hip_cnt_gap);
+    const double est_mean = est_entropy(hi_cnt_mean, lo_hi0_cnt_mean, lo_hip_cnt_mean);
+
+    // Use mean predictor when its estimated entropy is strictly lower
+    const bool use_mean_pred = (est_mean < est_gap);
 
     // ── Header ─────────────────────────────────────────────────────────────
     out_ptr->write(reinterpret_cast<const char*>(MAGIC), 4);
