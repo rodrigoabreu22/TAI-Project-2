@@ -296,7 +296,7 @@ int main(int argc, char* argv[]) {
                     B[ctx_hi] += r_s; Nc[ctx_hi]++;
                     if      (B[ctx_hi] >  Nc[ctx_hi]) { C[ctx_hi]++; B[ctx_hi] -= Nc[ctx_hi]; if (B[ctx_hi]>Nc[ctx_hi])  B[ctx_hi]=Nc[ctx_hi]; }
                     else if (B[ctx_hi] < -Nc[ctx_hi]) { C[ctx_hi]--; B[ctx_hi] += Nc[ctx_hi]; if (B[ctx_hi]<-Nc[ctx_hi]) B[ctx_hi]=-Nc[ctx_hi]; }
-                    if (Nc[ctx_hi] == 512) { Nc[ctx_hi] >>= 1; B[ctx_hi] >>= 1; }
+                    if (Nc[ctx_hi] == 64) { Nc[ctx_hi] >>= 1; B[ctx_hi] >>= 1; }
 
                     hi_W = hi; hi_N[col] = hi;
                 }
