@@ -13,9 +13,8 @@
 #                 show one summary table with total sizes and summed times.
 #                 bits/byte = total_compressed_bits / total_original_bytes.
 #                 Lossless = YES only if every file round-tripped correctly.
-#   -e            Evaluation mode: only runs your own compressor(s) on files A-H;
-#                 shows hardcoded reference values for standard compressors.
-#                 Much faster than re-running everything. Implies -m.
+#   -e            Evaluation mode: runs only -o tools on files A-H.
+#                 Faster than -m (skips A-M and standard compressors). Implies -m.
 #   -o TOOL_CMD   Add your own tool. Format: "name:compress_cmd:decompress_cmd"
 #                 Use %i/%o placeholders for file-argument tools:
 #                   -o "myc:./compress %i %o:./decompress %i %o"
@@ -440,17 +439,6 @@ bench_files_eval() {
         tt=$(awk "BEGIN{printf \"%.3f\", $tc+$td}")
         [[ "${acc_ok[$n]}" == "true" ]] && lm="YES" || lm="NO "
         sort_input+="$cb|$n|$total_orig_mb|$comp_mb|${ratio}%|$bpb|$tc|$td|$tt|$lm"$'\n'
-    done
-
-    # Hardcoded baselines
-    for row in "${EVAL_BASELINES[@]}"; do
-        read -r bname bcomp_mb bbpb btc btd <<< "$row"
-        local btt bratio bcb
-        btt=$(awk "BEGIN{printf \"%.3f\", $btc+$btd}")
-        bratio=$(awk "BEGIN{printf \"%.1f\", $bcomp_mb*100/$total_orig_mb}")
-        # sort key: convert comp_mb to bytes
-        bcb=$(awk "BEGIN{printf \"%d\", $bcomp_mb*1048576}")
-        sort_input+="$bcb|$bname|$total_orig_mb|$bcomp_mb|${bratio}%|$bbpb|$btc|$btd|$btt|YES"$'\n'
     done
 
     # Sort by compressed bytes
