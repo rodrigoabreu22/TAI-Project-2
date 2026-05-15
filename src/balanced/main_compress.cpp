@@ -198,8 +198,10 @@ int main(int argc, char* argv[]) {
             std::array<uint64_t,256> ti_lo_hi0_gap{}, ti_lo_hi0_mean{};
             std::array<uint64_t,256> ti_lo_hip_gap{}, ti_lo_hip_mean{};
 
+            std::vector<uint8_t> scan_hi_N(width, 0);
             for (uint32_t row = row_start; row < row_end; ++row) {
                 const uint32_t lr = row - row_start;
+                uint8_t scan_hi_W = 0;
                 for (uint32_t col = 0; col < width; ++col) {
                     uint16_t px = pixels[row * width + col];
                     uint16_t W  = (col > 0)               ? pixels[row*width+col-1]           : 0u;
@@ -209,7 +211,8 @@ int main(int argc, char* argv[]) {
                     uint16_t NW = (lr > 0 && col > 0)     ? pixels[(row-1)*width+col-1]       : W;
                     uint16_t NE = (lr > 0 && col<width-1) ? pixels[(row-1)*width+col+1]       : N;
 
-                    uint16_t pg = (lr == 0 && col == 0) ? 0u : gap_predict(W,WW,N,NN,NW,NE);
+                    uint16_t pg = (lr == 0 && col == 0) ? 0u
+                                : robust_gap_predict(W,WW,N,NN,NW,NE,scan_hi_W,scan_hi_N[col]);
                     uint16_t zg = zigzag_encode(static_cast<uint16_t>((int)px-(int)pg));
                     uint8_t hig = zg>>8; uint8_t log_ = zg&0xFF;
                     ti_hi_gap[hig]++;
@@ -219,6 +222,9 @@ int main(int argc, char* argv[]) {
                     uint8_t him = zm>>8; uint8_t lom = zm&0xFF;
                     ti_hi_mean[him]++;
                     if (him==0) ti_lo_hi0_mean[lom]++; else ti_lo_hip_mean[lom]++;
+
+                    scan_hi_W = hig;
+                    scan_hi_N[col] = hig;
                 }
             }
 
