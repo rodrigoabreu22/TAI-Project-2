@@ -22,16 +22,11 @@
  *  Bytes  4–  7 : width           uint32_t LE
  *  Bytes  8– 11 : height          uint32_t LE
  *  Bytes 12– 13 : global_mean     uint16_t LE
- *  Bytes 14–269  : hi_hist_gap[256]       uint8_t (scaled GAP hi distribution)
- *  Bytes 270–525 : lo_hi0hist_gap[256]    uint8_t
- *  Bytes 526–781 : lo_hiphist_gap[256]    uint8_t
- *  Bytes 782–1037 : hi_hist_mean[256]     uint8_t (scaled mean hi distribution)
- *  Bytes 1038–1293 : lo_hi0hist_mean[256] uint8_t
- *  Bytes 1294–1549 : lo_hiphist_mean[256] uint8_t
- *  Byte  1550 : ntiles            uint8_t
- *  Bytes 1551.. : pred_mode[ntiles]  uint8_t each (0=GAP, 1=mean, per tile)
- *  Then         : tile_sizes[ntiles] uint32_t LE each
- *  Then         : tile bitstreams concatenated
+ *  Byte  14   : ntiles              uint8_t
+ *  Bytes 15.. : pred_mode[ntiles]  uint8_t each (0=GAP, 1=mean, per tile)
+ *  Then       : tile_hists[ntiles × 3 × 256] uint8_t (hi + lo_hi0 + lo_hip per tile)
+ *  Then       : tile_sizes[ntiles] uint32_t LE each
+ *  Then       : tile bitstreams concatenated
  *
  * Usage:  compress_astro_balanced <input_file> <output_file>
  *         compress_astro_balanced          (stdin → stdout)
@@ -126,42 +121,6 @@ int main(int argc, char* argv[]) {
     for (uint64_t i = 0; i < npix; ++i) px_sum += pixels[i];
     const uint16_t global_mean = static_cast<uint16_t>(px_sum / npix);
 
-    // ── Global entropy scan — both predictors, for warm-model histograms ───
-    std::array<uint64_t,256> hi_cnt_gap{},     hi_cnt_mean{};
-    std::array<uint64_t,256> lo_hi0_cnt_gap{}, lo_hi0_cnt_mean{};
-    std::array<uint64_t,256> lo_hip_cnt_gap{}, lo_hip_cnt_mean{};
-
-    for (uint32_t row = 0; row < height; ++row) {
-        for (uint32_t col = 0; col < width; ++col) {
-            uint16_t px = pixels[row * width + col];
-            uint16_t W  = (col > 0)                    ? pixels[row*width+col-1]             : 0u;
-            uint16_t WW = (col > 1)                    ? pixels[row*width+col-2]             : W;
-            uint16_t N  = (row > 0)                    ? pixels[(row-1)*width+col]           : W;
-            uint16_t NN = (row > 1)                    ? pixels[(row-2)*width+col]           : N;
-            uint16_t NW = (row > 0 && col > 0)         ? pixels[(row-1)*width+col-1]         : W;
-            uint16_t NE = (row > 0 && col < width-1)   ? pixels[(row-1)*width+col+1]         : N;
-
-            uint16_t pg = (row == 0 && col == 0) ? 0u : gap_predict(W, WW, N, NN, NW, NE);
-            uint16_t zg = zigzag_encode(static_cast<uint16_t>((int)px - (int)pg));
-            uint8_t hig = zg >> 8; uint8_t log_ = zg & 0xFF;
-            hi_cnt_gap[hig]++;
-            if (hig == 0) lo_hi0_cnt_gap[log_]++; else lo_hip_cnt_gap[log_]++;
-
-            uint16_t zm = zigzag_encode(static_cast<uint16_t>((int)px - (int)global_mean));
-            uint8_t him = zm >> 8; uint8_t lom = zm & 0xFF;
-            hi_cnt_mean[him]++;
-            if (him == 0) lo_hi0_cnt_mean[lom]++; else lo_hip_cnt_mean[lom]++;
-        }
-    }
-
-    // Scale both sets for warm-model initialisation.
-    const auto hi_hist_gap    = scale_hist(hi_cnt_gap);
-    const auto lo_hi0hist_gap = scale_hist(lo_hi0_cnt_gap);
-    const auto lo_hiphist_gap = scale_hist(lo_hip_cnt_gap);
-    const auto hi_hist_mean    = scale_hist(hi_cnt_mean);
-    const auto lo_hi0hist_mean = scale_hist(lo_hi0_cnt_mean);
-    const auto lo_hiphist_mean = scale_hist(lo_hip_cnt_mean);
-
     // ── Shared helpers ─────────────────────────────────────────────────────
     auto entropy = [](const std::array<uint64_t,256>& cnt) -> double {
         uint64_t total = 0; for (auto c : cnt) total += c;
@@ -181,11 +140,15 @@ int main(int argc, char* argv[]) {
         if (lo < 128) return 6; return 7;
     };
 
-    // ── Tile-parallel encoding ─────────────────────────────────────────────
+    // ── Tile-parallel Phase 1: scan (parallel) ────────────────────────────
     const unsigned ntiles = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
     std::vector<std::string>  tile_bufs(ntiles);
     std::vector<uint8_t>      tile_pred_modes(ntiles);
     std::vector<std::thread>  threads(ntiles);
+
+    std::vector<std::array<uint64_t,256>> t_hi_gap(ntiles),     t_hi_mean(ntiles);
+    std::vector<std::array<uint64_t,256>> t_lo_hi0_gap(ntiles), t_lo_hi0_mean(ntiles);
+    std::vector<std::array<uint64_t,256>> t_lo_hip_gap(ntiles), t_lo_hip_mean(ntiles);
 
     for (unsigned t = 0; t < ntiles; ++t) {
         threads[t] = std::thread([&, t]() {
@@ -193,7 +156,6 @@ int main(int argc, char* argv[]) {
             const uint32_t row_end   = static_cast<uint32_t>(height * (t + 1) / ntiles);
             const uint64_t tile_npix = static_cast<uint64_t>(row_end - row_start) * width;
 
-            // Per-tile entropy scan to select predictor for this tile.
             std::array<uint64_t,256> ti_hi_gap{},     ti_hi_mean{};
             std::array<uint64_t,256> ti_lo_hi0_gap{}, ti_lo_hi0_mean{};
             std::array<uint64_t,256> ti_lo_hip_gap{}, ti_lo_hip_mean{};
@@ -240,7 +202,38 @@ int main(int argc, char* argv[]) {
                                   tile_est(ti_hi_gap,  ti_lo_hi0_gap,  ti_lo_hip_gap);
             tile_pred_modes[t] = use_mean ? 1u : 0u;
 
-            // Warm-start from the global histogram set matching this tile's predictor.
+            t_hi_gap[t]     = ti_hi_gap;     t_hi_mean[t]    = ti_hi_mean;
+            t_lo_hi0_gap[t] = ti_lo_hi0_gap; t_lo_hi0_mean[t]= ti_lo_hi0_mean;
+            t_lo_hip_gap[t] = ti_lo_hip_gap; t_lo_hip_mean[t]= ti_lo_hip_mean;
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    // Merge per-tile histograms → global (full-image quality warm-start).
+    std::array<uint64_t,256> g_hi_gap{},     g_hi_mean{};
+    std::array<uint64_t,256> g_lo_hi0_gap{}, g_lo_hi0_mean{};
+    std::array<uint64_t,256> g_lo_hip_gap{}, g_lo_hip_mean{};
+    for (unsigned t = 0; t < ntiles; ++t)
+        for (int i = 0; i < 256; ++i) {
+            g_hi_gap[i]     += t_hi_gap[t][i];     g_hi_mean[i]    += t_hi_mean[t][i];
+            g_lo_hi0_gap[i] += t_lo_hi0_gap[t][i]; g_lo_hi0_mean[i]+= t_lo_hi0_mean[t][i];
+            g_lo_hip_gap[i] += t_lo_hip_gap[t][i]; g_lo_hip_mean[i]+= t_lo_hip_mean[t][i];
+        }
+
+    const auto hi_hist_gap     = scale_hist(g_hi_gap);
+    const auto lo_hi0hist_gap  = scale_hist(g_lo_hi0_gap);
+    const auto lo_hiphist_gap  = scale_hist(g_lo_hip_gap);
+    const auto hi_hist_mean    = scale_hist(g_hi_mean);
+    const auto lo_hi0hist_mean = scale_hist(g_lo_hi0_mean);
+    const auto lo_hiphist_mean = scale_hist(g_lo_hip_mean);
+
+    // ── Tile-parallel Phase 2: encode ──────────────────────────────────────
+    for (unsigned t = 0; t < ntiles; ++t) {
+        threads[t] = std::thread([&, t]() {
+            const uint32_t row_start = static_cast<uint32_t>(height * t / ntiles);
+            const uint32_t row_end   = static_cast<uint32_t>(height * (t + 1) / ntiles);
+            const bool use_mean = (tile_pred_modes[t] == 1);
+
             const auto& wh    = use_mean ? hi_hist_mean    : hi_hist_gap;
             const auto& wlh0  = use_mean ? lo_hi0hist_mean : lo_hi0hist_gap;
             const auto& wlhip = use_mean ? lo_hiphist_mean : lo_hiphist_gap;
@@ -261,12 +254,12 @@ int main(int argc, char* argv[]) {
                 uint8_t hi_W = 0;
                 for (uint32_t col = 0; col < width; ++col) {
                     uint16_t px = pixels[row * width + col];
-                    uint16_t W  = (col > 0)                        ? pixels[row*width+col-1]         : 0u;
-                    uint16_t WW = (col > 1)                        ? pixels[row*width+col-2]         : W;
-                    uint16_t N  = (local_row > 0)                  ? pixels[(row-1)*width+col]       : W;
-                    uint16_t NN = (local_row > 1)                  ? pixels[(row-2)*width+col]       : N;
-                    uint16_t NW = (local_row>0 && col>0)           ? pixels[(row-1)*width+col-1]     : W;
-                    uint16_t NE = (local_row>0 && col<width-1)     ? pixels[(row-1)*width+col+1]     : N;
+                    uint16_t W  = (col > 0)                    ? pixels[row*width+col-1]         : 0u;
+                    uint16_t WW = (col > 1)                    ? pixels[row*width+col-2]         : W;
+                    uint16_t N  = (local_row > 0)              ? pixels[(row-1)*width+col]       : W;
+                    uint16_t NN = (local_row > 1)              ? pixels[(row-2)*width+col]       : N;
+                    uint16_t NW = (local_row>0 && col>0)       ? pixels[(row-1)*width+col-1]     : W;
+                    uint16_t NE = (local_row>0 && col<width-1) ? pixels[(row-1)*width+col+1]     : N;
 
                     uint8_t ctx_hi = static_cast<uint8_t>(quantize(hi_W)*4 + quantize(hi_N[col]));
 
@@ -313,7 +306,6 @@ int main(int argc, char* argv[]) {
             tile_bufs[t] = oss.str();
         });
     }
-
     for (auto& th : threads) th.join();
 
     // ── Header ─────────────────────────────────────────────────────────────
