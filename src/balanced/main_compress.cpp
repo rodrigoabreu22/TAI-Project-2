@@ -172,7 +172,7 @@ int main(int argc, char* argv[]) {
     };
 
     auto quantize = [](uint8_t h) -> int {
-        if (h == 0) return 0; if (h <= 2) return 1; if (h <= 7) return 2; return 3;
+        if (h == 0) return 0; if (h == 1) return 1; if (h <= 7) return 2; return 3;
     };
 
     auto quantize_prev_lo = [](uint8_t lo) -> int {
