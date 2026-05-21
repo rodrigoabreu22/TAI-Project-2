@@ -7,12 +7,14 @@
 #
 # Options:
 #   -d DIR        Data directory (default: data)
-#   -f FILES      Comma-separated file names to test (default: A,B,C,D,E,F,G,H)
+#   -f FILES      Comma-separated file names to test (default: all files in data/)
 #   -c            Test on concatenated file (all files joined — matches prof table)
 #   -m            Per-file aggregate mode: compress each file individually, then
 #                 show one summary table with total sizes and summed times.
 #                 bits/byte = total_compressed_bits / total_original_bytes.
 #                 Lossless = YES only if every file round-tripped correctly.
+#   -e            Evaluation mode: runs only -o tools on files A-H.
+#                 Faster than -m (skips A-M and standard compressors). Implies -m.
 #   -o TOOL_CMD   Add your own tool. Format: "name:compress_cmd:decompress_cmd"
 #                 Use %i/%o placeholders for file-argument tools:
 #                   -o "myc:./compress %i %o:./decompress %i %o"
@@ -22,9 +24,10 @@
 #   -h            Show this help
 #
 # Examples:
-#   ./benchmark.sh                          # test all files individually (one table each)
-#   ./benchmark.sh -c                       # concatenate A-H into one file, one table
+#   ./benchmark.sh                          # test all files in data/ (one table each)
+#   ./benchmark.sh -c                       # concatenate all files into one, one table
 #   ./benchmark.sh -m                       # per-file runs, single aggregate summary table
+#   ./benchmark.sh -e -o "ox:./compress %i %o:./decompress %i %o"   # fast eval vs baselines
 #   ./benchmark.sh -m -o "ox:./compress %i %o:./decompress %i %o"
 #   ./benchmark.sh -f C,D -r 3             # test files C and D, 3 timing runs
 # =============================================================================
@@ -36,9 +39,25 @@ DATA_DIR="data2"
 FILES_ARG="A,B,C,D,E,F,G,H"
 CONCAT_MODE=false
 MULTI_MODE=false
+EVAL_MODE=false
 OWN_TOOLS=()
 RUNS=1
 QUIET=false
+
+# Hardcoded reference results for standard compressors on files A-H
+# Format per entry: "name comp_mb bpb t_comp t_dcp"
+# Source: reference benchmark run on the original 8 training files (34.33 MB total)
+EVAL_BASELINES=(
+    "bzip2   15.36 3.579 0.253 0.134"
+    "lzma-5  15.79 3.679 1.525 0.086"
+    "lzma-9  15.81 3.684 1.522 0.086"
+    "xz-6    15.81 3.685 1.515 0.091"
+    "lzma-1  16.80 3.916 0.370 0.087"
+    "zstd-19 17.30 4.031 1.440 0.010"
+    "zstd-3  18.55 4.323 0.033 0.010"
+    "gzip    18.78 4.376 0.314 0.022"
+    "zstd-1  19.31 4.499 0.015 0.010"
+)
 
 # ---------- ANSI colours -----------------------------------------------------
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'
@@ -49,16 +68,17 @@ warn() { printf "${Y}[warn] ${N}%s\n" "$*" >&2; }
 err()  { printf "${R}[error]${N} %s\n" "$*" >&2; exit 1; }
 
 # ---------- arg parsing ------------------------------------------------------
-while getopts "d:f:cmo:r:qh" opt; do
+while getopts "d:f:cmeo:r:qh" opt; do
     case $opt in
         d) DATA_DIR="$OPTARG" ;;
         f) FILES_ARG="$OPTARG" ;;
         c) CONCAT_MODE=true ;;
         m) MULTI_MODE=true ;;
+        e) EVAL_MODE=true; MULTI_MODE=true ;;
         o) OWN_TOOLS+=("$OPTARG") ;;
         r) RUNS="$OPTARG" ;;
         q) QUIET=true ;;
-        h) sed -n '2,32p' "$0"; exit 0 ;;
+        h) sed -n '2,35p' "$0"; exit 0 ;;
         *) err "Unknown option -$OPTARG. Use -h for help." ;;
     esac
 done
@@ -363,9 +383,99 @@ bench_files_aggregate() {
     echo ""
 }
 
+# ---------- evaluation mode aggregate (-e) -----------------------------------
+# Only runs user's own tools on A-H; merges results with hardcoded baselines.
+bench_files_eval() {
+    local eval_files=()
+    for letter in A B C D E F G H; do
+        [[ -f "$DATA_DIR/$letter" ]] && eval_files+=("$letter")
+    done
+    [[ ${#eval_files[@]} -eq 0 ]] && err "No A-H files found in $DATA_DIR"
+
+    local num_files="${#eval_files[@]}"
+    local total_orig=0
+    for f in "${eval_files[@]}"; do
+        total_orig=$(( total_orig + $(stat -c%s "$DATA_DIR/$f") ))
+    done
+    local total_orig_mb
+    total_orig_mb=$(bytes_to_mb "$total_orig")
+
+    # Run only user's own tools
+    declare -A acc_comp acc_tc acc_td acc_ok
+    local i
+    for (( i=0; i<${#NAMES[@]}; i++ )); do
+        local n="${NAMES[$i]}"
+        acc_comp[$n]=0; acc_tc[$n]="0"; acc_td[$n]="0"; acc_ok[$n]="true"
+    done
+
+    for f in "${eval_files[@]}"; do
+        local fp="$DATA_DIR/$f"
+        log "File $f"
+        for (( i=0; i<${#NAMES[@]}; i++ )); do
+            local n="${NAMES[$i]}"
+            log "  -> $n ..."
+            read -r cb tc td ls <<< "$(bench_one "$fp" "$n" "${COMP_CMDS[$i]}" "${DECOMP_CMDS[$i]}")"
+            acc_comp[$n]=$(( acc_comp[$n] + cb ))
+            acc_tc[$n]=$(echo "${acc_tc[$n]} + $tc" | bc)
+            acc_td[$n]=$(echo "${acc_td[$n]} + $td" | bc)
+            [[ "$ls" != "YES" ]] && acc_ok[$n]="false"
+        done
+    done
+
+    # Build sortable list: "sort_key display_line"
+    # sort_key = compressed bytes (integer, for numeric sort)
+    local sort_input=""
+
+    # User tools
+    for (( i=0; i<${#NAMES[@]}; i++ )); do
+        local n="${NAMES[$i]}"
+        local cb="${acc_comp[$n]}"
+        local comp_mb ratio bpb tc td tt lm
+        comp_mb=$(bytes_to_mb "$cb")
+        ratio=$(ratio_pct "$total_orig" "$cb")
+        bpb=$(bits_per_sym "$total_orig" "$cb")
+        tc=$(awk "BEGIN{printf \"%.3f\", ${acc_tc[$n]} / $num_files}")
+        td=$(awk "BEGIN{printf \"%.3f\", ${acc_td[$n]} / $num_files}")
+        tt=$(awk "BEGIN{printf \"%.3f\", $tc+$td}")
+        [[ "${acc_ok[$n]}" == "true" ]] && lm="YES" || lm="NO "
+        sort_input+="$cb|$n|$total_orig_mb|$comp_mb|${ratio}%|$bpb|$tc|$td|$tt|$lm"$'\n'
+    done
+
+    # Sort by compressed bytes
+    mapfile -t sorted_rows <<< "$(echo "$sort_input" | grep -v '^$' | sort -t'|' -k1 -n)"
+
+    local label
+    label="Per-file aggregate ($(IFS=+; echo "${eval_files[*]}"))  —  ${num_files} files, ${total_orig_mb} MB total  [times = mean per file]"
+    print_header "$label"
+
+    local rank=1
+    for entry in "${sorted_rows[@]}"; do
+        [[ -z "$entry" ]] && continue
+        IFS='|' read -r _ n orig_mb comp_mb ratio bpb tc td tt lm <<< "$entry"
+        local lossless_mark
+        [[ "$lm" == "YES" ]] && lossless_mark="${G}YES${N}" || lossless_mark="${R}NO ${N}"
+        printf "| %-4s | %-14s | %12s | %12s | %6s | %9s | %9s | %9s | %9s | %-9b |\n" \
+            "$rank" "$n" "$orig_mb" "$comp_mb" "$ratio" \
+            "$bpb" "$tc" "$td" "$tt" "$lossless_mark"
+        (( rank++ ))
+    done
+    separator
+    echo ""
+}
+
 # ---------- main -------------------------------------------------------------
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Auto-discover files in DATA_DIR if -f not specified
+if [[ -z "$FILES_ARG" ]]; then
+    discovered=()
+    while IFS= read -r -d '' f; do
+        discovered+=("$(basename "$f")")
+    done < <(find "$DATA_DIR" -maxdepth 1 -type f -not -name '.*' -print0 | sort -z)
+    [[ ${#discovered[@]} -eq 0 ]] && err "No files found in $DATA_DIR"
+    FILES_ARG=$(IFS=','; echo "${discovered[*]}")
+fi
 
 IFS=',' read -ra FILE_LIST <<< "$FILES_ARG"
 
@@ -381,8 +491,16 @@ printf "${W}  TAI Project 1 — Compression Benchmark${N}\n"
 printf "${W}  Runs per compressor: $RUNS${N}\n"
 printf "${W}========================================================${N}\n"
 
-if $CONCAT_MODE; then
-    # Concatenate all selected files into one
+if $EVAL_MODE; then
+    # In eval mode only run user's own tools (strip built-in compressors)
+    NAMES=(); COMP_CMDS=(); DECOMP_CMDS=()
+    for OWN_TOOL in "${OWN_TOOLS[@]}"; do
+        IFS=':' read -r own_name own_comp own_decomp <<< "$OWN_TOOL"
+        add_compressor "$own_name" "$own_comp" "$own_decomp"
+    done
+    [[ ${#NAMES[@]} -eq 0 ]] && err "Eval mode (-e) requires at least one -o tool."
+    bench_files_eval
+elif $CONCAT_MODE; then
     cat_file="$WORK_DIR/concat"
     log "Concatenating files: ${FILE_LIST[*]}"
     for f in "${FILE_LIST[@]}"; do
