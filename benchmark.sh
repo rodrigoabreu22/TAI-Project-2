@@ -35,8 +35,8 @@
 set -euo pipefail
 
 # ---------- defaults ---------------------------------------------------------
-DATA_DIR="data2"
-FILES_ARG="A,B,C,D,E,F,G,H"
+DATA_DIR="data"
+FILES_ARG=""          # empty = auto-discover all files in DATA_DIR
 CONCAT_MODE=false
 MULTI_MODE=false
 EVAL_MODE=false
