@@ -57,13 +57,6 @@ static void write_u32le(std::ostream& out, uint32_t v) {
     out.put(static_cast<char>((v >> 24) & 0xFF));
 }
 
-static void write_u16le(std::ostream& out, uint16_t v) {
-    out.put(static_cast<char>(v       & 0xFF));
-    out.put(static_cast<char>((v >> 8) & 0xFF));
-}
-
-static FastFrequencyTable make_flat256() { return FastFrequencyTable{}; }
-
 // Map lo byte to one of 8 log-scale bins for ORDER-1 lo context.
 static int quantize_prev_lo(uint8_t lo) {
     if (lo == 0)  return 0;
@@ -149,12 +142,6 @@ int main(int argc, char* argv[]) {
     std::array<std::array<uint64_t,256>,NCLASS> hi_med{},  hi_mean{};
     std::array<std::array<uint64_t,256>,NCLASS> lo0_med{}, lo0_mean{};
     std::array<std::array<uint64_t,256>,NCLASS> lop_med{}, lop_mean{};
-    for (int c = 0; c < NCLASS; ++c) {
-        hi_med[c].fill(0); hi_mean[c].fill(0);
-        lo0_med[c].fill(0); lo0_mean[c].fill(0);
-        lop_med[c].fill(0); lop_mean[c].fill(0);
-    }
-
     for (uint32_t row = 0; row < height; ++row) {
         for (uint32_t col = 0; col < width; ++col) {
             uint16_t px = pixels[row * width + col];
@@ -230,42 +217,22 @@ int main(int argc, char* argv[]) {
     write_u32le(*out_ptr, width);
     write_u32le(*out_ptr, height);
     out_ptr->put(static_cast<char>(use_mean ? 1 : 0));
-    write_u16le(*out_ptr, global_mean);
+    out_ptr->put(static_cast<char>(global_mean & 0xFF));
+    out_ptr->put(static_cast<char>((global_mean >> 8) & 0xFF));
 
-    // hi models        : 365 × 256-symbol fine per-context adaptive models.
-    // hi_class_priors  : 4 × 256-symbol class-level priors (flat/slight/moderate/strong).
-    //   Each prior is a bounded running summary of hi statistics for its gradient
-    //   class, capped at HI_PRIOR_CAP total counts by periodic halving.
-    //   At encode time hi is coded via MixedFrequencyTable(fine, class_prior):
-    //     • Sparse fine context  (few visits): class prior dominates → correct prior
-    //     • Dense  fine context  (many visits): fine model dominates → no dilution
-    //   This is context mixing: Strategy A.
+    // hi models (365): fine per-context adaptive models.
+    // hi_class_priors (4): gradient-class priors for context mixing.
     // lo_hi0_models: 32 × 256-symbol, indexed by (grad_class × 8 + prev_lo_bin).
-    //   grad_class  [0-3]: coarse gradient magnitude (flat/slight/moderate/strong).
-    //   prev_lo_bin [0-7]: log-scale quantisation of the previous hi=0 lo byte.
-    //   ORDER-1 on the lo byte when hi=0 captures the persistence of small
-    //   residuals: if the last small-residual pixel had lo≈5, the current one
-    //   is likely also near 5. 32 tables keep each well-populated (~56K samples).
     // lo_hip_models: 255 × 256-symbol, indexed by (hi-1) for hi in [1,255].
     static constexpr int    LO_HI0_CLASSES   = 4;
     static constexpr int    LO_HI0_PREV_BINS = 8;
     static constexpr int    LO_HI0_TOTAL     = LO_HI0_CLASSES * LO_HI0_PREV_BINS;
-    static constexpr uint32_t HI_PRIOR_CAP   = 1024;  // keeps class priors bounded
+    static constexpr uint32_t HI_PRIOR_CAP   = 1024;
 
-    std::vector<FastFrequencyTable> hi_models, hi_class_priors,
-                                    lo_hi0_models, lo_hip_models;
-    hi_models.reserve(NUM_CONTEXTS);
-    for (int i = 0; i < NUM_CONTEXTS; ++i)
-        hi_models.push_back(make_flat256());
-    hi_class_priors.reserve(LO_HI0_CLASSES);
-    for (int i = 0; i < LO_HI0_CLASSES; ++i)
-        hi_class_priors.push_back(make_flat256());
-    lo_hi0_models.reserve(LO_HI0_TOTAL);
-    for (int i = 0; i < LO_HI0_TOTAL; ++i)
-        lo_hi0_models.push_back(make_flat256());
-    lo_hip_models.reserve(255);
-    for (int i = 0; i < 255; ++i)
-        lo_hip_models.push_back(make_flat256());
+    std::vector<FastFrequencyTable> hi_models(NUM_CONTEXTS);
+    std::vector<FastFrequencyTable> hi_class_priors(LO_HI0_CLASSES);
+    std::vector<FastFrequencyTable> lo_hi0_models(LO_HI0_TOTAL);
+    std::vector<FastFrequencyTable> lo_hip_models(255);
 
     // hi-neighbor models for global-mean mode (16 contexts).
     // Used instead of the 365-gradient model when use_mean=true.
@@ -275,7 +242,7 @@ int main(int argc, char* argv[]) {
     static constexpr int HI_NBR_BINS = 4;
     static constexpr int NUM_HI_NBR  = HI_NBR_BINS * HI_NBR_BINS;  // 16
 
-    std::vector<FastFrequencyTable> hi_nbr_models(NUM_HI_NBR, make_flat256());
+    std::vector<FastFrequencyTable> hi_nbr_models(NUM_HI_NBR);
     std::vector<int> C_nbr(NUM_HI_NBR, 0);
     std::vector<int> B_nbr(NUM_HI_NBR, 0);
     std::vector<int> Nc_nbr(NUM_HI_NBR, 0);
@@ -300,13 +267,13 @@ int main(int argc, char* argv[]) {
             uint16_t N  = (row > 0)            ? pixels[(row-1) * width + col]           : W;
             uint16_t NW = (row > 0 && col > 0) ? pixels[(row-1) * width + col - 1]       : W;
 
-            // lo_hi0_ctx: gradient class needed by lo models in both modes.
-            // ctx and sign: only needed in MED mode — computed there instead.
+            // Compute gradients once; reused for lo_hi0_ctx and (in MED mode) spatial_context.
+            int D1 = 0, D2 = 0, D3 = 0;
             int lo_hi0_ctx = 0;
             if (row > 0 && col > 0) {
-                int D1 = static_cast<int>(N)  - static_cast<int>(NW);
-                int D2 = static_cast<int>(NW) - static_cast<int>(W);
-                int D3 = static_cast<int>(W)  - static_cast<int>(WW);
+                D1 = static_cast<int>(N)  - static_cast<int>(NW);
+                D2 = static_cast<int>(NW) - static_cast<int>(W);
+                D3 = static_cast<int>(W)  - static_cast<int>(WW);
                 int grad_max = std::max({std::abs(D1), std::abs(D2), std::abs(D3)});
                 lo_hi0_ctx = (grad_max < GRAD_T1) ? 0 :
                              (grad_max < GRAD_T2) ? 1 :
@@ -358,12 +325,8 @@ int main(int argc, char* argv[]) {
             } else {
                 // ── MED mode: 365-gradient context + class priors ─────────────
                 int sign = 1, ctx = 0;
-                if (row > 0 && col > 0) {
-                    int D1 = static_cast<int>(N)  - static_cast<int>(NW);
-                    int D2 = static_cast<int>(NW) - static_cast<int>(W);
-                    int D3 = static_cast<int>(W)  - static_cast<int>(WW);
+                if (row > 0 && col > 0)
                     ctx = spatial_context(D1, D2, D3, sign);
-                }
                 uint16_t pred = (row == 0 && col == 0) ? 0u : med_predict(W, N, NW);
                 uint16_t pred_adj = static_cast<uint16_t>(
                     static_cast<int>(pred) + sign * C[ctx]);
@@ -373,17 +336,12 @@ int main(int argc, char* argv[]) {
                 hi = static_cast<uint8_t>(z >> 8);
                 lo = static_cast<uint8_t>(z & 0xFF);
 
-                {
-                    MixedFrequencyTable mixed(hi_models[ctx], hi_class_priors[lo_hi0_ctx]);
-                    enc.write(mixed, hi);
-                }
+                MixedFrequencyTable mixed(hi_models[ctx], hi_class_priors[lo_hi0_ctx]);
+                enc.write(mixed, hi);
                 hi_models[ctx].increment(hi);
                 hi_class_priors[lo_hi0_ctx].increment(hi);
-                if (hi_class_priors[lo_hi0_ctx].getTotal() > HI_PRIOR_CAP) {
-                    for (uint32_t s = 0; s < 256; ++s)
-                        hi_class_priors[lo_hi0_ctx].set(
-                            s, std::max(1u, hi_class_priors[lo_hi0_ctx].get(s) >> 1));
-                }
+                if (hi_class_priors[lo_hi0_ctx].getTotal() > HI_PRIOR_CAP)
+                    hi_class_priors[lo_hi0_ctx].halve();
 
                 if (hi == 0) {
                     int lo_idx = lo_hi0_ctx * LO_HI0_PREV_BINS

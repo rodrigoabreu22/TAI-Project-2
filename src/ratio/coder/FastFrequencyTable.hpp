@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include "FrequencyTable.hpp"
 
@@ -65,6 +66,22 @@ public:
         total_ = (uint32_t)((int32_t)total_ + delta);
         for (uint32_t j = s + 1; j <= N; j += lowbit(j))
             tree_[j] = (uint32_t)((int32_t)tree_[j] + delta);
+    }
+
+    // Halve all frequencies (min 1) and rebuild the Fenwick tree in O(N)
+    // instead of N individual set() calls (each O(log N)).
+    void halve() {
+        total_ = 0;
+        for (uint32_t i = 0; i < N; ++i) {
+            freq_[i] = std::max(1u, freq_[i] >> 1);
+            total_ += freq_[i];
+        }
+        tree_[0] = 0;
+        for (uint32_t j = 1; j <= N; ++j) tree_[j] = freq_[j - 1];
+        for (uint32_t j = 1; j <= N; ++j) {
+            uint32_t parent = j + lowbit(j);
+            if (parent <= N) tree_[parent] += tree_[j];
+        }
     }
 
     // O(8) descent — no binary search, no getLow calls.

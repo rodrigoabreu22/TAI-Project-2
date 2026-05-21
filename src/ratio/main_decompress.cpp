@@ -29,8 +29,6 @@ static uint32_t read_u32le(std::istream& in) {
     return v;
 }
 
-static FastFrequencyTable make_flat256() { return FastFrequencyTable{}; }
-
 static int quantize_prev_lo(uint8_t lo) {
     if (lo == 0)  return 0;
     if (lo < 4)   return 1;
@@ -93,25 +91,15 @@ int main(int argc, char* argv[]) {
     static constexpr int      LO_HI0_TOTAL     = LO_HI0_CLASSES * LO_HI0_PREV_BINS;
     static constexpr uint32_t HI_PRIOR_CAP     = 1024;
 
-    std::vector<FastFrequencyTable> hi_models, hi_class_priors,
-                                    lo_hi0_models, lo_hip_models;
-    hi_models.reserve(NUM_CONTEXTS);
-    for (int i = 0; i < NUM_CONTEXTS; ++i)
-        hi_models.push_back(make_flat256());
-    hi_class_priors.reserve(LO_HI0_CLASSES);
-    for (int i = 0; i < LO_HI0_CLASSES; ++i)
-        hi_class_priors.push_back(make_flat256());
-    lo_hi0_models.reserve(LO_HI0_TOTAL);
-    for (int i = 0; i < LO_HI0_TOTAL; ++i)
-        lo_hi0_models.push_back(make_flat256());
-    lo_hip_models.reserve(255);
-    for (int i = 0; i < 255; ++i)
-        lo_hip_models.push_back(make_flat256());
+    std::vector<FastFrequencyTable> hi_models(NUM_CONTEXTS);
+    std::vector<FastFrequencyTable> hi_class_priors(LO_HI0_CLASSES);
+    std::vector<FastFrequencyTable> lo_hi0_models(LO_HI0_TOTAL);
+    std::vector<FastFrequencyTable> lo_hip_models(255);
 
     static constexpr int HI_NBR_BINS = 4;
     static constexpr int NUM_HI_NBR  = HI_NBR_BINS * HI_NBR_BINS;
 
-    std::vector<FastFrequencyTable> hi_nbr_models(NUM_HI_NBR, make_flat256());
+    std::vector<FastFrequencyTable> hi_nbr_models(NUM_HI_NBR);
     std::vector<int> C_nbr(NUM_HI_NBR, 0);
     std::vector<int> B_nbr(NUM_HI_NBR, 0);
     std::vector<int> Nc_nbr(NUM_HI_NBR, 0);
@@ -134,11 +122,12 @@ int main(int argc, char* argv[]) {
             uint16_t N  = (row > 0)            ? pixels[(row-1) * width + col]           : W;
             uint16_t NW = (row > 0 && col > 0) ? pixels[(row-1) * width + col - 1]       : W;
 
+            int D1 = 0, D2 = 0, D3 = 0;
             int lo_hi0_ctx = 0;
             if (row > 0 && col > 0) {
-                int D1 = static_cast<int>(N)  - static_cast<int>(NW);
-                int D2 = static_cast<int>(NW) - static_cast<int>(W);
-                int D3 = static_cast<int>(W)  - static_cast<int>(WW);
+                D1 = static_cast<int>(N)  - static_cast<int>(NW);
+                D2 = static_cast<int>(NW) - static_cast<int>(W);
+                D3 = static_cast<int>(W)  - static_cast<int>(WW);
                 int grad_max = std::max({std::abs(D1), std::abs(D2), std::abs(D3)});
                 lo_hi0_ctx = (grad_max < GRAD_T1) ? 0 :
                              (grad_max < GRAD_T2) ? 1 :
@@ -189,21 +178,14 @@ int main(int argc, char* argv[]) {
             } else {
                 // ── MED mode: 365-gradient context ────────────────────────────
                 int sign = 1, ctx = 0;
-                if (row > 0 && col > 0) {
-                    int D1 = static_cast<int>(N)  - static_cast<int>(NW);
-                    int D2 = static_cast<int>(NW) - static_cast<int>(W);
-                    int D3 = static_cast<int>(W)  - static_cast<int>(WW);
+                if (row > 0 && col > 0)
                     ctx = spatial_context(D1, D2, D3, sign);
-                }
                 MixedFrequencyTable mixed_hi(hi_models[ctx], hi_class_priors[lo_hi0_ctx]);
                 hi = static_cast<uint8_t>(dec.read(mixed_hi));
                 hi_models[ctx].increment(hi);
                 hi_class_priors[lo_hi0_ctx].increment(hi);
-                if (hi_class_priors[lo_hi0_ctx].getTotal() > HI_PRIOR_CAP) {
-                    for (uint32_t s = 0; s < 256; ++s)
-                        hi_class_priors[lo_hi0_ctx].set(
-                            s, std::max(1u, hi_class_priors[lo_hi0_ctx].get(s) >> 1));
-                }
+                if (hi_class_priors[lo_hi0_ctx].getTotal() > HI_PRIOR_CAP)
+                    hi_class_priors[lo_hi0_ctx].halve();
 
                 if (hi == 0) {
                     int lo_idx = lo_hi0_ctx * LO_HI0_PREV_BINS
