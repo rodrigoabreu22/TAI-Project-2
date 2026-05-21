@@ -1,90 +1,187 @@
-/*
- * TAI Project 2 — Astronomical Image Decompressor (ox-astro-fast)
- *
- * Usage:  decompress_astro_fast <input_file> <output_file>
- *         decompress_astro_fast          (stdin → stdout)
- */
-
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <vector>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 
 #include "coder/RangeCoder.hpp"
-#include "coder/FrequencyTable.hpp"
+#include "common/FastFormat.hpp"
+#include "common/OrderedParallelProcessor.hpp"
+#include "model/FastByteModel.hpp"
 #include "model/ImagePredictor.hpp"
 
-static constexpr uint8_t MAGIC[4] = {'T','A','2','F'};
+namespace {
 
-static uint32_t read_u32le(std::istream& in) {
-    uint32_t v = 0;
-    for (int i = 0; i < 4; ++i)
-        v |= static_cast<uint32_t>(static_cast<uint8_t>(in.get())) << (8 * i);
-    return v;
+constexpr std::size_t kWorkerCount = 8;
+constexpr std::size_t kMaxPendingChunks = 16;
+
+struct DecompressionTask {
+    fast::BlockMode mode;
+    std::uint32_t width;
+    std::uint32_t raw_size;
+    std::string payload;
+};
+
+std::string processChunk(DecompressionTask task) {
+    if (task.mode == fast::BlockMode::Raw) {
+        if (task.payload.size() != task.raw_size)
+            throw std::runtime_error("invalid raw chunk");
+        return task.payload;
+    }
+
+    if (task.mode != fast::BlockMode::RangeCoded)
+        throw std::runtime_error("invalid block mode");
+
+    std::istringstream payload_in(task.payload, std::ios::binary | std::ios::in);
+    RangeDecoder dec(payload_in);
+    FastByteModel hi_model;
+    FastByteModel lo_model;
+
+    std::string raw(task.raw_size, '\0');
+    const std::uint32_t row_bytes = task.width * 2u;
+    const std::uint32_t rows = task.raw_size / row_bytes;
+
+    for (std::uint32_t row = 0; row < rows; ++row) {
+        char *row_ptr = raw.data() + static_cast<std::size_t>(row) * row_bytes;
+        std::uint16_t prev = 0;
+        for (std::uint32_t col = 0; col < task.width; ++col) {
+            std::uint8_t hi = hi_model.decodeSymbol(dec);
+            std::uint8_t lo = lo_model.decodeSymbol(dec);
+
+            std::uint16_t z = static_cast<std::uint16_t>(
+                (static_cast<std::uint16_t>(hi) << 8) | lo);
+            std::uint16_t u = zigzag_decode(z);
+            std::uint16_t px = static_cast<std::uint16_t>(prev + u);
+            prev = px;
+
+            row_ptr[2u * col] = static_cast<char>(px >> 8);
+            row_ptr[2u * col + 1u] = static_cast<char>(px & 0xFF);
+        }
+    }
+
+    return raw;
 }
 
-static SimpleFrequencyTable make_flat256() {
-    return SimpleFrequencyTable(std::vector<uint32_t>(256, 1u));
-}
+}  // namespace
 
-int main(int argc, char* argv[]) {
-    std::istream* in_ptr  = &std::cin;
-    std::ostream* out_ptr = &std::cout;
+int main(int argc, char *argv[]) {
+    std::istream *in_ptr = &std::cin;
+    std::ostream *out_ptr = &std::cout;
     std::ifstream fin;
     std::ofstream fout;
 
     if (argc >= 3) {
         fin.open(argv[1], std::ios::binary);
-        if (!fin)  { std::cerr << "Cannot open input: "  << argv[1] << '\n'; return 1; }
+        if (!fin) {
+            std::cerr << "Cannot open input: " << argv[1] << '\n';
+            return 1;
+        }
         fout.open(argv[2], std::ios::binary);
-        if (!fout) { std::cerr << "Cannot open output: " << argv[2] << '\n'; return 1; }
-        in_ptr  = &fin;
+        if (!fout) {
+            std::cerr << "Cannot open output: " << argv[2] << '\n';
+            return 1;
+        }
+        in_ptr = &fin;
         out_ptr = &fout;
     } else if (argc == 1) {
-        std::cin.sync_with_stdio(false);
+        std::ios::sync_with_stdio(false);
+        std::cin.tie(nullptr);
     } else {
-        std::cerr << "Usage: decompress_astro_fast <input> <output>\n"; return 1;
+        std::cerr << "Usage: decompress_astro_fast <input> <output>\n";
+        return 1;
     }
 
-    uint8_t magic[4];
-    in_ptr->read(reinterpret_cast<char*>(magic), 4);
-    for (int i = 0; i < 4; ++i)
-        if (magic[i] != MAGIC[i]) { std::cerr << "Bad magic\n"; return 1; }
+    char magic[4];
+    in_ptr->read(magic, 4);
+    if (!*in_ptr || std::string(magic, 4) != std::string(fast::kMagic, 4)) {
+        std::cerr << "Bad magic\n";
+        return 1;
+    }
 
-    const uint32_t width  = read_u32le(*in_ptr);
-    const uint32_t height = read_u32le(*in_ptr);
-    const uint64_t npix   = static_cast<uint64_t>(width) * height;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t rows_per_chunk = 0;
+    if (!fast::readUint32(*in_ptr, width) ||
+        !fast::readUint32(*in_ptr, height) ||
+        !fast::readUint32(*in_ptr, rows_per_chunk) ||
+        width == 0 || height == 0 || rows_per_chunk == 0) {
+        std::cerr << "Invalid header\n";
+        return 1;
+    }
 
-    std::vector<uint16_t> pixels(npix);
+    try {
+        OrderedParallelProcessor<DecompressionTask, std::string> processor(
+            kWorkerCount, processChunk);
 
-    SimpleFrequencyTable hi_model = make_flat256();
-    SimpleFrequencyTable lo_model = make_flat256();
+        std::size_t submitted = 0;
+        std::size_t next_to_write = 0;
+        std::uint64_t total_written = 0;
+        const std::uint64_t expected_bytes =
+            static_cast<std::uint64_t>(width) * height * 2u;
 
-    RangeDecoder dec(*in_ptr);
+        while (true) {
+            int mode_value = in_ptr->get();
+            if (mode_value == std::char_traits<char>::eof())
+                break;
 
-    for (uint32_t row = 0; row < height; ++row) {
-        for (uint32_t col = 0; col < width; ++col) {
-            uint8_t hi = static_cast<uint8_t>(dec.read(hi_model));
-            hi_model.increment(hi);
+            std::uint32_t raw_size = 0;
+            std::uint32_t payload_size = 0;
+            if (!fast::readUint32(*in_ptr, raw_size) ||
+                !fast::readUint32(*in_ptr, payload_size) ||
+                raw_size == 0 || (raw_size % (width * 2u)) != 0) {
+                std::cerr << "Invalid chunk header\n";
+                return 1;
+            }
 
-            uint8_t lo = static_cast<uint8_t>(dec.read(lo_model));
-            lo_model.increment(lo);
+            std::string payload(payload_size, '\0');
+            in_ptr->read(payload.data(), static_cast<std::streamsize>(payload_size));
+            if (!*in_ptr) {
+                std::cerr << "Truncated chunk payload\n";
+                return 1;
+            }
 
-            uint16_t z    = (static_cast<uint16_t>(hi) << 8) | lo;
-            uint16_t u    = zigzag_decode(z);
+            while (submitted - next_to_write >= kMaxPendingChunks) {
+                std::string ready = processor.takeNext(next_to_write);
+                out_ptr->write(ready.data(), static_cast<std::streamsize>(ready.size()));
+                total_written += ready.size();
+                next_to_write++;
+            }
 
-            uint16_t pred = (col > 0) ? pixels[row * width + col - 1] : 0u;
-            pixels[row * width + col] = static_cast<uint16_t>(pred + u);
+            processor.submit(submitted, DecompressionTask{
+                                            static_cast<fast::BlockMode>(
+                                                static_cast<std::uint8_t>(mode_value)),
+                                            width,
+                                            raw_size,
+                                            std::move(payload),
+                                        });
+            submitted++;
+
+            std::string ready;
+            while (processor.tryTakeNext(next_to_write, ready)) {
+                out_ptr->write(ready.data(), static_cast<std::streamsize>(ready.size()));
+                total_written += ready.size();
+                next_to_write++;
+            }
         }
+
+        processor.closeInput();
+        while (next_to_write < submitted) {
+            std::string ready = processor.takeNext(next_to_write);
+            out_ptr->write(ready.data(), static_cast<std::streamsize>(ready.size()));
+            total_written += ready.size();
+            next_to_write++;
+        }
+
+        if (total_written != expected_bytes) {
+            std::cerr << "Decoded size mismatch\n";
+            return 1;
+        }
+    } catch (const std::exception &ex) {
+        std::cerr << "Error: " << ex.what() << '\n';
+        return 1;
     }
 
-    std::vector<uint8_t> out_bytes(npix * 2);
-    for (uint64_t i = 0; i < npix; ++i) {
-        out_bytes[2*i]   = static_cast<uint8_t>(pixels[i] >> 8);
-        out_bytes[2*i+1] = static_cast<uint8_t>(pixels[i] & 0xFF);
-    }
-    out_ptr->write(reinterpret_cast<const char*>(out_bytes.data()),
-                   static_cast<std::streamsize>(out_bytes.size()));
-    return 0;
+    return *out_ptr ? 0 : 1;
 }

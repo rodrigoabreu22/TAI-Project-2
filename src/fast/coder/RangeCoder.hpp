@@ -57,11 +57,7 @@ public:
     explicit RangeEncoder(std::ostream& o)
         : out_(o), low_(0), range_(0xFFFFFFFFu), cache_(0), pending_(0) {}
 
-    void write(const FrequencyTable& freqs, uint32_t symbol) {
-        uint32_t total = freqs.getTotal();
-        uint32_t sym_low = freqs.getLow(symbol);
-        uint32_t sym_high = freqs.getHigh(symbol);
-
+    void write(uint32_t sym_low, uint32_t sym_high, uint32_t total) {
         uint32_t r = range_ / total;
         low_ += static_cast<uint64_t>(sym_low) * r;
         range_ = (sym_high < total) ? (sym_high - sym_low) * r : range_ - sym_low * r;
@@ -70,6 +66,13 @@ public:
             range_ <<= 8;
             shift_low();
         }
+    }
+
+    void write(const FrequencyTable& freqs, uint32_t symbol) {
+        uint32_t total = freqs.getTotal();
+        uint32_t sym_low = freqs.getLow(symbol);
+        uint32_t sym_high = freqs.getHigh(symbol);
+        write(sym_low, sym_high, total);
     }
 
     // Flush all buffered state. Must be called after the last symbol.
@@ -100,14 +103,13 @@ public:
             code_ = (code_ << 8) | read_byte();
     }
 
-    uint32_t read(const FrequencyTable& freqs) {
-        uint32_t total = freqs.getTotal();
+    uint32_t getTarget(uint32_t total) const {
         uint32_t r = range_ / total;
-        uint32_t value = std::min(code_ / r, total - 1u);
+        return std::min(code_ / r, total - 1u);
+    }
 
-        uint32_t symbol = freqs.findSymbol(value);
-        uint32_t sym_low = freqs.getLow(symbol);
-        uint32_t sym_high = freqs.getHigh(symbol);
+    void consume(uint32_t sym_low, uint32_t sym_high, uint32_t total) {
+        uint32_t r = range_ / total;
 
         code_ -= sym_low * r;
         range_ = (sym_high < total) ? (sym_high - sym_low) * r : range_ - sym_low * r;
@@ -116,6 +118,17 @@ public:
             code_ = (code_ << 8) | read_byte();
             range_ <<= 8;
         }
+    }
+
+    uint32_t read(const FrequencyTable& freqs) {
+        uint32_t total = freqs.getTotal();
+        uint32_t value = getTarget(total);
+
+        uint32_t symbol = freqs.findSymbol(value);
+        uint32_t sym_low = freqs.getLow(symbol);
+        uint32_t sym_high = freqs.getHigh(symbol);
+
+        consume(sym_low, sym_high, total);
         return symbol;
     }
 };
