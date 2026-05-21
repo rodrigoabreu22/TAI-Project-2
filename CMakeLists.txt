@@ -34,10 +34,12 @@ file(GLOB BALANCED_SOURCES src/balanced/coder/*.cpp)
 add_executable(compress_astro_balanced
     src/balanced/main_compress.cpp ${BALANCED_SOURCES})
 target_include_directories(compress_astro_balanced PRIVATE src/balanced)
+target_link_libraries(compress_astro_balanced PRIVATE Threads::Threads)
 
 add_executable(decompress_astro_balanced
     src/balanced/main_decompress.cpp ${BALANCED_SOURCES})
 target_include_directories(decompress_astro_balanced PRIVATE src/balanced)
+target_link_libraries(decompress_astro_balanced PRIVATE Threads::Threads)
 
 # ── astro-fast ────────────────────────────────────────────────────────────────
 # Horizontal delta + ORDER-0 hi + ORDER-0 lo (2 models total)
@@ -47,7 +49,9 @@ file(GLOB FAST_SOURCES src/fast/coder/*.cpp)
 add_executable(compress_astro_fast
     src/fast/main_compress.cpp ${FAST_SOURCES})
 target_include_directories(compress_astro_fast PRIVATE src/fast)
+target_link_libraries(compress_astro_fast PRIVATE Threads::Threads)
 
 add_executable(decompress_astro_fast
     src/fast/main_decompress.cpp ${FAST_SOURCES})
 target_include_directories(decompress_astro_fast PRIVATE src/fast)
+target_link_libraries(decompress_astro_fast PRIVATE Threads::Threads)
