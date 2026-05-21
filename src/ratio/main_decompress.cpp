@@ -42,6 +42,13 @@ static int quantize_prev_lo(uint8_t lo) {
     return 7;
 }
 
+static int quantize_hi_val(uint8_t h) {
+    if (h == 0)  return 0;
+    if (h <= 2)  return 1;
+    if (h <= 7)  return 2;
+    return 3;
+}
+
 int main(int argc, char* argv[]) {
     std::istream* in_ptr  = &std::cin;
     std::ostream* out_ptr = &std::cout;
@@ -74,6 +81,11 @@ int main(int argc, char* argv[]) {
     const uint32_t height = read_u32le(*in_ptr);
     const uint64_t npix   = static_cast<uint64_t>(width) * height;
 
+    const bool     use_mean    = (in_ptr->get() != 0);
+    const uint16_t global_mean = static_cast<uint16_t>(
+        static_cast<uint8_t>(in_ptr->get()) |
+        (static_cast<uint16_t>(static_cast<uint8_t>(in_ptr->get())) << 8));
+
     std::vector<uint16_t> pixels(npix);
 
     static constexpr int      LO_HI0_CLASSES   = 4;
@@ -96,7 +108,15 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < 255; ++i)
         lo_hip_models.push_back(make_flat256());
 
-    // Bias correction state — must be identical to encoder
+    static constexpr int HI_NBR_BINS = 4;
+    static constexpr int NUM_HI_NBR  = HI_NBR_BINS * HI_NBR_BINS;
+
+    std::vector<FastFrequencyTable> hi_nbr_models(NUM_HI_NBR, make_flat256());
+    std::vector<int> C_nbr(NUM_HI_NBR, 0);
+    std::vector<int> B_nbr(NUM_HI_NBR, 0);
+    std::vector<int> Nc_nbr(NUM_HI_NBR, 0);
+
+    // Bias correction state for MED mode — must be identical to encoder
     std::vector<int> C(NUM_CONTEXTS, 0);
     std::vector<int> B(NUM_CONTEXTS, 0);
     std::vector<int> Nc(NUM_CONTEXTS, 0);
@@ -104,82 +124,119 @@ int main(int argc, char* argv[]) {
     RangeDecoder dec(*in_ptr);
 
     uint8_t prev_lo_hi0 = 0;
+    std::vector<uint8_t> hi_N_arr(width, 0u);
 
     for (uint32_t row = 0; row < height; ++row) {
+        uint8_t hi_W_mean = 0;
         for (uint32_t col = 0; col < width; ++col) {
-            uint16_t W  = (col > 0)                    ? pixels[row * width + col - 1]              : 0u;
-            uint16_t WW = (col > 1)                    ? pixels[row * width + col - 2]              : W;
-            uint16_t N  = (row > 0)                    ? pixels[(row-1) * width + col]              : W;
-            uint16_t NN = (row > 1)                    ? pixels[(row-2) * width + col]              : N;
-            uint16_t NW = (row > 0 && col > 0)         ? pixels[(row-1) * width + col - 1]          : W;
-            uint16_t NE = (row > 0 && col < width - 1) ? pixels[(row-1) * width + col + 1]          : N;
+            uint16_t W  = (col > 0)            ? pixels[row * width + col - 1]           : 0u;
+            uint16_t WW = (col > 1)            ? pixels[row * width + col - 2]           : W;
+            uint16_t N  = (row > 0)            ? pixels[(row-1) * width + col]           : W;
+            uint16_t NW = (row > 0 && col > 0) ? pixels[(row-1) * width + col - 1]       : W;
 
-            // Same context computation as encoder (pixels decoded left-to-right)
-            int sign = 1;
-            int ctx  = 0;
             int lo_hi0_ctx = 0;
             if (row > 0 && col > 0) {
                 int D1 = static_cast<int>(N)  - static_cast<int>(NW);
                 int D2 = static_cast<int>(NW) - static_cast<int>(W);
                 int D3 = static_cast<int>(W)  - static_cast<int>(WW);
-                ctx = spatial_context(D1, D2, D3, sign);
                 int grad_max = std::max({std::abs(D1), std::abs(D2), std::abs(D3)});
                 lo_hi0_ctx = (grad_max < GRAD_T1) ? 0 :
                              (grad_max < GRAD_T2) ? 1 :
                              (grad_max < GRAD_T3) ? 2 : 3;
             }
 
-            MixedFrequencyTable mixed_hi(hi_models[ctx], hi_class_priors[lo_hi0_ctx]);
-            uint8_t hi = static_cast<uint8_t>(dec.read(mixed_hi));
-            hi_models[ctx].increment(hi);
-            hi_class_priors[lo_hi0_ctx].increment(hi);
-            if (hi_class_priors[lo_hi0_ctx].getTotal() > HI_PRIOR_CAP) {
-                for (uint32_t s = 0; s < 256; ++s) {
-                    hi_class_priors[lo_hi0_ctx].set(
-                        s, std::max(1u, hi_class_priors[lo_hi0_ctx].get(s) >> 1));
+            uint8_t hi, lo;
+
+            if (use_mean) {
+                // ── Global-mean mode: hi-neighbor context ─────────────────────
+                int hi_ctx = quantize_hi_val(hi_W_mean) * HI_NBR_BINS
+                           + quantize_hi_val(hi_N_arr[col]);
+                hi = static_cast<uint8_t>(dec.read(hi_nbr_models[hi_ctx]));
+                hi_nbr_models[hi_ctx].increment(hi);
+
+                if (hi == 0) {
+                    int lo_idx = lo_hi0_ctx * LO_HI0_PREV_BINS
+                               + quantize_prev_lo(prev_lo_hi0);
+                    lo = static_cast<uint8_t>(dec.read(lo_hi0_models[lo_idx]));
+                    lo_hi0_models[lo_idx].increment(lo);
+                    prev_lo_hi0 = lo;
+                } else {
+                    lo = static_cast<uint8_t>(dec.read(lo_hip_models[hi - 1]));
+                    lo_hip_models[hi - 1].increment(lo);
                 }
-            }
 
-            uint8_t lo;
-            if (hi == 0) {
-                int lo_idx = lo_hi0_ctx * LO_HI0_PREV_BINS
-                           + quantize_prev_lo(prev_lo_hi0);
-                lo = static_cast<uint8_t>(dec.read(lo_hi0_models[lo_idx]));
-                lo_hi0_models[lo_idx].increment(lo);
-                prev_lo_hi0 = lo;
+                uint16_t z      = (static_cast<uint16_t>(hi) << 8) | lo;
+                uint16_t u_norm = zigzag_decode(z);
+                uint16_t pred_adj = static_cast<uint16_t>(
+                    static_cast<int>(global_mean) + C_nbr[hi_ctx]);
+                pixels[row * width + col] = static_cast<uint16_t>(pred_adj + u_norm);
+
+                int r_s = (u_norm <= 32767u) ? static_cast<int>(u_norm)
+                                             : static_cast<int>(u_norm) - 65536;
+                B_nbr[hi_ctx] += r_s; Nc_nbr[hi_ctx]++;
+                if (B_nbr[hi_ctx] > Nc_nbr[hi_ctx]) {
+                    C_nbr[hi_ctx]++; B_nbr[hi_ctx] -= Nc_nbr[hi_ctx];
+                    if (B_nbr[hi_ctx] > Nc_nbr[hi_ctx]) B_nbr[hi_ctx] = Nc_nbr[hi_ctx];
+                } else if (B_nbr[hi_ctx] < -Nc_nbr[hi_ctx]) {
+                    C_nbr[hi_ctx]--; B_nbr[hi_ctx] += Nc_nbr[hi_ctx];
+                    if (B_nbr[hi_ctx] < -Nc_nbr[hi_ctx]) B_nbr[hi_ctx] = -Nc_nbr[hi_ctx];
+                }
+                if (Nc_nbr[hi_ctx] == 512) { Nc_nbr[hi_ctx] >>= 1; B_nbr[hi_ctx] >>= 1; }
+
+                hi_W_mean   = hi;
+                hi_N_arr[col] = hi;
+
             } else {
-                lo = static_cast<uint8_t>(dec.read(lo_hip_models[hi - 1]));
-                lo_hip_models[hi - 1].increment(lo);
+                // ── MED mode: 365-gradient context ────────────────────────────
+                int sign = 1, ctx = 0;
+                if (row > 0 && col > 0) {
+                    int D1 = static_cast<int>(N)  - static_cast<int>(NW);
+                    int D2 = static_cast<int>(NW) - static_cast<int>(W);
+                    int D3 = static_cast<int>(W)  - static_cast<int>(WW);
+                    ctx = spatial_context(D1, D2, D3, sign);
+                }
+                MixedFrequencyTable mixed_hi(hi_models[ctx], hi_class_priors[lo_hi0_ctx]);
+                hi = static_cast<uint8_t>(dec.read(mixed_hi));
+                hi_models[ctx].increment(hi);
+                hi_class_priors[lo_hi0_ctx].increment(hi);
+                if (hi_class_priors[lo_hi0_ctx].getTotal() > HI_PRIOR_CAP) {
+                    for (uint32_t s = 0; s < 256; ++s)
+                        hi_class_priors[lo_hi0_ctx].set(
+                            s, std::max(1u, hi_class_priors[lo_hi0_ctx].get(s) >> 1));
+                }
+
+                if (hi == 0) {
+                    int lo_idx = lo_hi0_ctx * LO_HI0_PREV_BINS
+                               + quantize_prev_lo(prev_lo_hi0);
+                    lo = static_cast<uint8_t>(dec.read(lo_hi0_models[lo_idx]));
+                    lo_hi0_models[lo_idx].increment(lo);
+                    prev_lo_hi0 = lo;
+                } else {
+                    lo = static_cast<uint8_t>(dec.read(lo_hip_models[hi - 1]));
+                    lo_hip_models[hi - 1].increment(lo);
+                }
+
+                uint16_t z      = (static_cast<uint16_t>(hi) << 8) | lo;
+                uint16_t u_norm = zigzag_decode(z);
+                uint16_t pred   = (row == 0 && col == 0) ? 0u : med_predict(W, N, NW);
+                uint16_t pred_adj = static_cast<uint16_t>(
+                    static_cast<int>(pred) + sign * C[ctx]);
+                uint16_t u = u_norm;
+                if (sign == -1) u = static_cast<uint16_t>(0u - u_norm);
+                pixels[row * width + col] = static_cast<uint16_t>(pred_adj + u);
+
+                int r_s = (u_norm <= 32767u) ? static_cast<int>(u_norm)
+                                             : static_cast<int>(u_norm) - 65536;
+                B[ctx] += r_s; Nc[ctx]++;
+                if (B[ctx] > Nc[ctx]) {
+                    C[ctx]++; B[ctx] -= Nc[ctx];
+                    if (B[ctx] > Nc[ctx]) B[ctx] = Nc[ctx];
+                } else if (B[ctx] < -Nc[ctx]) {
+                    C[ctx]--; B[ctx] += Nc[ctx];
+                    if (B[ctx] < -Nc[ctx]) B[ctx] = -Nc[ctx];
+                }
+                if (Nc[ctx] == 512) { Nc[ctx] >>= 1; B[ctx] >>= 1; }
             }
-
-            uint16_t z     = (static_cast<uint16_t>(hi) << 8) | lo;
-            uint16_t u_norm = zigzag_decode(z);
-
-            // Apply bias correction with the CURRENT C[ctx] — same as encoder did
-            // before its own update. Pixel must be reconstructed first.
-            uint16_t pred = (row == 0 && col == 0) ? 0u : med_predict(W, N, NW);
-            uint16_t pred_adj = static_cast<uint16_t>(
-                static_cast<int>(pred) + sign * C[ctx]);
-
-            uint16_t u = u_norm;
-            if (sign == -1) u = static_cast<uint16_t>(0u - u_norm);
-            pixels[row * width + col] = static_cast<uint16_t>(pred_adj + u);
-
-            // Bias update — identical to encoder, runs after pixel is written
-            int r_s = (u_norm <= 32767u) ? static_cast<int>(u_norm)
-                                         : static_cast<int>(u_norm) - 65536;
-            B[ctx] += r_s;
-            Nc[ctx]++;
-            if (B[ctx] > Nc[ctx]) {
-                C[ctx]++;
-                B[ctx] -= Nc[ctx];
-                if (B[ctx] > Nc[ctx]) B[ctx] = Nc[ctx];
-            } else if (B[ctx] < -Nc[ctx]) {
-                C[ctx]--;
-                B[ctx] += Nc[ctx];
-                if (B[ctx] < -Nc[ctx]) B[ctx] = -Nc[ctx];
-            }
-            if (Nc[ctx] == 512) { Nc[ctx] >>= 1; B[ctx] >>= 1; }
         }
     }
 

@@ -105,14 +105,13 @@ This concentrates probability mass near 0 regardless of residual sign.
 
 | | Predictor | hi model | lo model | Models total | Magic |
 |---|-----------|----------|----------|--------------|-------|
-| **ratio** | JPEG-LS MED + bias correction | 365 spatial contexts + 4 class priors (context mixing) | 32 tables (hi=0, grad_class×prev_lo_bin) + 255 tables (hi>0) | 656 | `TA2A` |
-| **balanced** | JPEG-LS MED | ORDER-1 (256 tables, ctx=prev hi) | ORDER-0 (1 shared table) | 257 | `TA2B` |
+| **ratio** | Adaptive (MED or global-mean, chosen per-file by entropy pre-scan) | MED mode: 365 spatial contexts + 4 class priors. Mean mode: 16 hi-neighbor contexts | 32 tables (hi=0, grad_class×prev_lo_bin) + 255 tables (hi>0) | 381 or 16+287 | `TA2A` |
+| **balanced** | Adaptive (GAP or global-mean, chosen per-file by entropy pre-scan) | 16 hi-neighbor contexts (both modes) | 32 tables (hi=0) + 255 tables (hi>0) | 303 | `TA2B` |
 | **fast** | Horizontal delta (left neighbour) | ORDER-0 (1 table) | ORDER-0 (1 table) | 2 | `TA2F` |
 
-**JPEG-LS MED predictor** (`W`=left, `N`=above, `NW`=above-left):
+**Neighbours used by ratio** (`W`=left, `WW`=two-left, `N`=above, `NW`=above-left):
 ```
-if   NW ≥ max(W, N):  pred = min(W, N)
-elif NW ≤ min(W, N):  pred = max(W, N)
-else:                 pred = W + N − NW
+MED:  if NW ≥ max(W,N): pred=min(W,N)  elif NW ≤ min(W,N): pred=max(W,N)  else: pred=W+N−NW
+Mean: pred = global image mean  (calibration-type images)
 ```
-Selects horizontal/vertical prediction at edges and bilinear interpolation in smooth regions.
+Gradients D1=N−NW, D2=NW−W, D3=W−WW drive both the 365-context spatial index and the lo model's 4-class index.
