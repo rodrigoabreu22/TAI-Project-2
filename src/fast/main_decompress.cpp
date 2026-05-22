@@ -102,11 +102,11 @@ int main(int argc, char *argv[]) {
 
     std::uint32_t width = 0;
     std::uint32_t height = 0;
-    std::uint32_t rows_per_chunk = 0;
+    std::uint32_t chunk_layout_hint = 0;
     if (!fast::readUint32(*in_ptr, width) ||
         !fast::readUint32(*in_ptr, height) ||
-        !fast::readUint32(*in_ptr, rows_per_chunk) ||
-        width == 0 || height == 0 || rows_per_chunk == 0) {
+        !fast::readUint32(*in_ptr, chunk_layout_hint) ||
+        width == 0 || height == 0 || chunk_layout_hint == 0) {
         std::cerr << "Invalid header\n";
         return 1;
     }

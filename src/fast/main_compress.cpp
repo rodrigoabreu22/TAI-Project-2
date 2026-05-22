@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,7 +23,8 @@ constexpr std::size_t kMaxPendingChunks = 16;
 
 struct CompressionTask {
     std::uint32_t width;
-    std::string raw_bytes;
+    const char *raw_bytes;
+    std::size_t raw_size;
 };
 
 struct EncodedChunk {
@@ -43,10 +46,10 @@ std::string compressChunk(const CompressionTask &task) {
     FastByteModel lo_model;
 
     const std::uint32_t row_bytes = task.width * 2u;
-    const std::uint32_t rows = static_cast<std::uint32_t>(task.raw_bytes.size()) / row_bytes;
+    const std::uint32_t rows = static_cast<std::uint32_t>(task.raw_size) / row_bytes;
 
     for (std::uint32_t row = 0; row < rows; ++row) {
-        const char *row_ptr = task.raw_bytes.data() + static_cast<std::size_t>(row) * row_bytes;
+        const char *row_ptr = task.raw_bytes + static_cast<std::size_t>(row) * row_bytes;
         std::uint16_t prev = 0;
         for (std::uint32_t col = 0; col < task.width; ++col) {
             std::uint16_t px = read_be_u16(row_ptr + static_cast<std::size_t>(col) * 2u);
@@ -63,11 +66,13 @@ std::string compressChunk(const CompressionTask &task) {
 }
 
 EncodedChunk processChunk(CompressionTask task) {
-    const std::uint32_t raw_size = static_cast<std::uint32_t>(task.raw_bytes.size());
+    const std::uint32_t raw_size = static_cast<std::uint32_t>(task.raw_size);
     std::string compressed = compressChunk(task);
 
-    if (compressed.size() >= task.raw_bytes.size()) {
-        return EncodedChunk{fast::BlockMode::Raw, raw_size, std::move(task.raw_bytes)};
+    if (compressed.size() >= task.raw_size) {
+        return EncodedChunk{fast::BlockMode::Raw,
+                            raw_size,
+                            std::string(task.raw_bytes, task.raw_size)};
     }
 
     return EncodedChunk{fast::BlockMode::RangeCoded, raw_size, std::move(compressed)};
@@ -92,11 +97,42 @@ void inferImageShape(std::uint64_t npix, std::uint32_t &width, std::uint32_t &he
     }
 }
 
+bool parseDimension(const char *text, std::uint32_t &value) {
+    char *end = nullptr;
+    unsigned long long parsed = std::strtoull(text, &end, 10);
+    if (text == end || *end != '\0' || parsed == 0 ||
+        parsed > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+
+    value = static_cast<std::uint32_t>(parsed);
+    return true;
+}
+
 void writeChunk(std::ostream &out, const EncodedChunk &chunk) {
     out.put(static_cast<char>(chunk.mode));
     fast::writeUint32(out, chunk.raw_size);
     fast::writeUint32(out, static_cast<std::uint32_t>(chunk.payload.size()));
     out.write(chunk.payload.data(), static_cast<std::streamsize>(chunk.payload.size()));
+}
+
+std::string readAll(std::istream &in) {
+    if (auto *file = dynamic_cast<std::ifstream *>(&in)) {
+        file->seekg(0, std::ios::end);
+        std::streamoff size = file->tellg();
+        if (size >= 0) {
+            file->seekg(0, std::ios::beg);
+            std::string data(static_cast<std::size_t>(size), '\0');
+            file->read(data.data(), static_cast<std::streamsize>(data.size()));
+            if (!*file)
+                throw std::runtime_error("failed to read input");
+            return data;
+        }
+        file->clear();
+        file->seekg(0, std::ios::beg);
+    }
+
+    return std::string(std::istreambuf_iterator<char>(in), {});
 }
 
 }  // namespace
@@ -106,8 +142,30 @@ int main(int argc, char *argv[]) {
     std::ostream *out_ptr = &std::cout;
     std::ifstream fin;
     std::ofstream fout;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    bool explicit_shape = false;
 
-    if (argc >= 3) {
+    if (argc == 5) {
+        if (!parseDimension(argv[1], height) || !parseDimension(argv[2], width)) {
+            std::cerr << "Invalid image dimensions\n";
+            return 1;
+        }
+        explicit_shape = true;
+
+        fin.open(argv[3], std::ios::binary);
+        if (!fin) {
+            std::cerr << "Cannot open input: " << argv[3] << '\n';
+            return 1;
+        }
+        fout.open(argv[4], std::ios::binary);
+        if (!fout) {
+            std::cerr << "Cannot open output: " << argv[4] << '\n';
+            return 1;
+        }
+        in_ptr = &fin;
+        out_ptr = &fout;
+    } else if (argc == 3) {
         fin.open(argv[1], std::ios::binary);
         if (!fin) {
             std::cerr << "Cannot open input: " << argv[1] << '\n';
@@ -124,36 +182,57 @@ int main(int argc, char *argv[]) {
         std::ios::sync_with_stdio(false);
         std::cin.tie(nullptr);
     } else {
-        std::cerr << "Usage: compress_astro_fast <input> <output>\n";
+        std::cerr << "Usage: compress_astro_fast <n_rows> <n_cols> <input> <output>\n"
+                  << "   or: compress_astro_fast <input> <output>\n";
         return 1;
     }
 
-    std::string raw(std::istreambuf_iterator<char>(*in_ptr), {});
+    std::string raw;
+    try {
+        raw = readAll(*in_ptr);
+    } catch (const std::exception &ex) {
+        std::cerr << "Error: " << ex.what() << '\n';
+        return 1;
+    }
     if (raw.size() % 2 != 0) {
         std::cerr << "Input size not even\n";
         return 1;
     }
 
     const std::uint64_t npix = raw.size() / 2u;
-    std::uint32_t width = 0;
-    std::uint32_t height = 0;
-    inferImageShape(npix, width, height);
+    if (explicit_shape) {
+        const std::uint64_t expected_npix =
+            static_cast<std::uint64_t>(width) * height;
+        if (expected_npix != npix) {
+            std::cerr << "Input size does not match dimensions\n";
+            return 1;
+        }
+    } else {
+        inferImageShape(npix, width, height);
+    }
 
     out_ptr->write(fast::kMagic, 4);
     fast::writeUint32(*out_ptr, width);
     fast::writeUint32(*out_ptr, height);
-    fast::writeUint32(*out_ptr, fast::kRowsPerChunk);
+    fast::writeUint32(*out_ptr, fast::kChunkCount);
 
     try {
         OrderedParallelProcessor<CompressionTask, EncodedChunk> processor(
             kWorkerCount, processChunk);
 
         const std::size_t row_bytes = static_cast<std::size_t>(width) * 2u;
+        const std::uint32_t chunk_count = std::min(fast::kChunkCount, height);
         std::size_t submitted = 0;
         std::size_t next_to_write = 0;
 
-        for (std::uint32_t row = 0; row < height; row += fast::kRowsPerChunk) {
-            std::uint32_t rows_this_chunk = std::min(fast::kRowsPerChunk, height - row);
+        for (std::uint32_t chunk = 0; chunk < chunk_count; ++chunk) {
+            const std::uint32_t row =
+                static_cast<std::uint32_t>((static_cast<std::uint64_t>(height) * chunk) /
+                                           chunk_count);
+            const std::uint32_t next_row =
+                static_cast<std::uint32_t>((static_cast<std::uint64_t>(height) * (chunk + 1u)) /
+                                           chunk_count);
+            std::uint32_t rows_this_chunk = next_row - row;
             std::size_t chunk_size = static_cast<std::size_t>(rows_this_chunk) * row_bytes;
             std::size_t offset = static_cast<std::size_t>(row) * row_bytes;
 
@@ -165,7 +244,8 @@ int main(int argc, char *argv[]) {
 
             processor.submit(submitted, CompressionTask{
                                             width,
-                                            raw.substr(offset, chunk_size),
+                                            raw.data() + offset,
+                                            chunk_size,
                                         });
             submitted++;
 
