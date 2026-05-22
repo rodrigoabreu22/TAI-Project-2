@@ -3,11 +3,11 @@
 
 Data-specific lossless compressor for raw astronomical images. Input is a raw raster of **1500×1500 unsigned 16-bit integers (big-endian)**. Three independent compressors are provided, each targeting a different trade-off between compression ratio and speed.
 
-| Tool | Strategy | bits/byte |
-|------|----------|-----------|
+| Tool | Strategy | bits/byte (baseline) |
+|------|----------|---------------------|
 | `ox-astro-ratio`    | JPEG-LS MED + 365-context spatial model + context mixing + bias correction | **3.497** |
-| `ox-astro-balanced` | JPEG-LS MED + ORDER-1 hi + ORDER-0 lo | 3.611 |
-| `ox-astro-fast`     | Horizontal delta + ORDER-0 | 3.601 |
+| `ox-astro-balanced` | JPEG-LS MED + ORDER-1 hi + ORDER-0 lo     | 3.611 |
+| `ox-astro-fast`     | Horizontal delta + ORDER-0                | 3.601 |
 
 ## Authors
 
