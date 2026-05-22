@@ -1,15 +1,11 @@
 /*
- * TAI Project 2 — Astronomical Image Decompressor (ox-astro-balanced)
+ * TAI Project 2 — Astronomical Image Decompressor (ox-astro-ratio)
  *
- * Inverse of main_compress.cpp:
- *   1. Read header: magic "TA2A", width, height.
- *   2. Decode hi/lo bytes per pixel via ORDER-1 range decoding.
- *   3. Reconstruct zigzag uint16_t residuals from byte pairs.
- *   4. Inverse-zigzag → signed residual; add JPEG-LS MED prediction.
- *   5. Write pixels as big-endian uint16_t.
+ * Inverse of main_compress.cpp: reads header, reconstructs pixels using
+ * the same JPEG-LS MED predictor and spatial context as the encoder.
  *
- * Usage:  decompress_astro <input_file> <output_file>
- *         decompress_astro          (stdin → stdout)
+ * Usage:  decompress_astro_ratio <input_file> <output_file>
+ *         decompress_astro_ratio          (stdin → stdout)
  */
 
 #include <cstdint>
@@ -20,6 +16,8 @@
 
 #include "coder/RangeCoder.hpp"
 #include "coder/FrequencyTable.hpp"
+#include "coder/FastFrequencyTable.hpp"
+#include "coder/MixedFrequencyTable.hpp"
 #include "model/ImagePredictor.hpp"
 
 static constexpr uint8_t MAGIC[4] = {'T','A','2','A'};
@@ -31,8 +29,22 @@ static uint32_t read_u32le(std::istream& in) {
     return v;
 }
 
-static SimpleFrequencyTable make_flat256() {
-    return SimpleFrequencyTable(std::vector<uint32_t>(256, 1u));
+static int quantize_prev_lo(uint8_t lo) {
+    if (lo == 0)  return 0;
+    if (lo < 4)   return 1;
+    if (lo < 8)   return 2;
+    if (lo < 16)  return 3;
+    if (lo < 32)  return 4;
+    if (lo < 64)  return 5;
+    if (lo < 128) return 6;
+    return 7;
+}
+
+static int quantize_hi_val(uint8_t h) {
+    if (h == 0)  return 0;
+    if (h <= 2)  return 1;
+    if (h <= 7)  return 2;
+    return 3;
 }
 
 int main(int argc, char* argv[]) {
@@ -51,7 +63,7 @@ int main(int argc, char* argv[]) {
     } else if (argc == 1) {
         std::cin.sync_with_stdio(false);
     } else {
-        std::cerr << "Usage: decompress_astro <input> <output>\n"; return 1;
+        std::cerr << "Usage: decompress_astro_ratio <input> <output>\n"; return 1;
     }
 
     // Verify magic
@@ -67,38 +79,146 @@ int main(int argc, char* argv[]) {
     const uint32_t height = read_u32le(*in_ptr);
     const uint64_t npix   = static_cast<uint64_t>(width) * height;
 
+    const bool     use_mean    = (in_ptr->get() != 0);
+    const uint16_t global_mean = static_cast<uint16_t>(
+        static_cast<uint8_t>(in_ptr->get()) |
+        (static_cast<uint16_t>(static_cast<uint8_t>(in_ptr->get())) << 8));
+
     std::vector<uint16_t> pixels(npix);
 
-    std::vector<SimpleFrequencyTable> hi_models, lo_models;
-    hi_models.reserve(256);
-    lo_models.reserve(256);
-    for (int i = 0; i < 256; ++i) {
-        hi_models.push_back(make_flat256());
-        lo_models.push_back(make_flat256());
-    }
+    static constexpr int      LO_HI0_CLASSES   = 4;
+    static constexpr int      LO_HI0_PREV_BINS = 8;
+    static constexpr int      LO_HI0_TOTAL     = LO_HI0_CLASSES * LO_HI0_PREV_BINS;
+    static constexpr uint32_t HI_PRIOR_CAP     = 1024;
+
+    std::vector<FastFrequencyTable> hi_models(NUM_CONTEXTS);
+    std::vector<FastFrequencyTable> hi_class_priors(LO_HI0_CLASSES);
+    std::vector<FastFrequencyTable> lo_hi0_models(LO_HI0_TOTAL);
+    std::vector<FastFrequencyTable> lo_hip_models(255);
+
+    static constexpr int HI_NBR_BINS = 4;
+    static constexpr int NUM_HI_NBR  = HI_NBR_BINS * HI_NBR_BINS;
+
+    std::vector<FastFrequencyTable> hi_nbr_models(NUM_HI_NBR);
+    std::vector<int> C_nbr(NUM_HI_NBR, 0);
+    std::vector<int> B_nbr(NUM_HI_NBR, 0);
+    std::vector<int> Nc_nbr(NUM_HI_NBR, 0);
+
+    // Bias correction state for MED mode — must be identical to encoder
+    std::vector<int> C(NUM_CONTEXTS, 0);
+    std::vector<int> B(NUM_CONTEXTS, 0);
+    std::vector<int> Nc(NUM_CONTEXTS, 0);
 
     RangeDecoder dec(*in_ptr);
 
-    uint8_t prev_hi = 0;
+    uint8_t prev_lo_hi0 = 0;
+    std::vector<uint8_t> hi_N_arr(width, 0u);
+
     for (uint32_t row = 0; row < height; ++row) {
+        uint8_t hi_W_mean = 0;
         for (uint32_t col = 0; col < width; ++col) {
-            uint8_t hi = static_cast<uint8_t>(dec.read(hi_models[prev_hi]));
-            hi_models[prev_hi].increment(hi);
+            uint16_t W  = (col > 0)            ? pixels[row * width + col - 1]           : 0u;
+            uint16_t WW = (col > 1)            ? pixels[row * width + col - 2]           : W;
+            uint16_t N  = (row > 0)            ? pixels[(row-1) * width + col]           : W;
+            uint16_t NW = (row > 0 && col > 0) ? pixels[(row-1) * width + col - 1]       : W;
 
-            uint8_t lo = static_cast<uint8_t>(dec.read(lo_models[hi]));
-            lo_models[hi].increment(lo);
+            int D1 = 0, D2 = 0, D3 = 0;
+            int lo_hi0_ctx = 0;
+            if (row > 0 && col > 0) {
+                D1 = static_cast<int>(N)  - static_cast<int>(NW);
+                D2 = static_cast<int>(NW) - static_cast<int>(W);
+                D3 = static_cast<int>(W)  - static_cast<int>(WW);
+                int grad_max = std::max({std::abs(D1), std::abs(D2), std::abs(D3)});
+                lo_hi0_ctx = (grad_max < GRAD_T1) ? 0 :
+                             (grad_max < GRAD_T2) ? 1 :
+                             (grad_max < GRAD_T3) ? 2 : 3;
+            }
 
-            uint16_t z    = (static_cast<uint16_t>(hi) << 8) | lo;
-            uint16_t u    = zigzag_decode(z);
+            uint8_t hi, lo;
 
-            uint16_t W  = (col  > 0)             ? pixels[row * width + col - 1]       : 0u;
-            uint16_t N  = (row  > 0)             ? pixels[(row-1) * width + col]        : W;
-            uint16_t NW = (row  > 0 && col  > 0) ? pixels[(row-1) * width + col - 1]   : W;
+            if (use_mean) {
+                // ── Global-mean mode: hi-neighbor context ─────────────────────
+                int hi_ctx = quantize_hi_val(hi_W_mean) * HI_NBR_BINS
+                           + quantize_hi_val(hi_N_arr[col]);
+                hi = static_cast<uint8_t>(dec.read(hi_nbr_models[hi_ctx]));
+                hi_nbr_models[hi_ctx].increment(hi);
 
-            uint16_t pred = (row == 0 && col == 0) ? 0u : med_predict(W, N, NW);
-            pixels[row * width + col] = static_cast<uint16_t>(pred + u);
+                if (hi == 0) {
+                    int lo_idx = lo_hi0_ctx * LO_HI0_PREV_BINS
+                               + quantize_prev_lo(prev_lo_hi0);
+                    lo = static_cast<uint8_t>(dec.read(lo_hi0_models[lo_idx]));
+                    lo_hi0_models[lo_idx].increment(lo);
+                    prev_lo_hi0 = lo;
+                } else {
+                    lo = static_cast<uint8_t>(dec.read(lo_hip_models[hi - 1]));
+                    lo_hip_models[hi - 1].increment(lo);
+                }
 
-            prev_hi = hi;
+                uint16_t z      = (static_cast<uint16_t>(hi) << 8) | lo;
+                uint16_t u_norm = zigzag_decode(z);
+                uint16_t pred_adj = static_cast<uint16_t>(
+                    static_cast<int>(global_mean) + C_nbr[hi_ctx]);
+                pixels[row * width + col] = static_cast<uint16_t>(pred_adj + u_norm);
+
+                int r_s = (u_norm <= 32767u) ? static_cast<int>(u_norm)
+                                             : static_cast<int>(u_norm) - 65536;
+                B_nbr[hi_ctx] += r_s; Nc_nbr[hi_ctx]++;
+                if (B_nbr[hi_ctx] > Nc_nbr[hi_ctx]) {
+                    C_nbr[hi_ctx]++; B_nbr[hi_ctx] -= Nc_nbr[hi_ctx];
+                    if (B_nbr[hi_ctx] > Nc_nbr[hi_ctx]) B_nbr[hi_ctx] = Nc_nbr[hi_ctx];
+                } else if (B_nbr[hi_ctx] < -Nc_nbr[hi_ctx]) {
+                    C_nbr[hi_ctx]--; B_nbr[hi_ctx] += Nc_nbr[hi_ctx];
+                    if (B_nbr[hi_ctx] < -Nc_nbr[hi_ctx]) B_nbr[hi_ctx] = -Nc_nbr[hi_ctx];
+                }
+                if (Nc_nbr[hi_ctx] == 512) { Nc_nbr[hi_ctx] >>= 1; B_nbr[hi_ctx] >>= 1; }
+
+                hi_W_mean   = hi;
+                hi_N_arr[col] = hi;
+
+            } else {
+                // ── MED mode: 365-gradient context ────────────────────────────
+                int sign = 1, ctx = 0;
+                if (row > 0 && col > 0)
+                    ctx = spatial_context(D1, D2, D3, sign);
+                MixedFrequencyTable mixed_hi(hi_models[ctx], hi_class_priors[lo_hi0_ctx]);
+                hi = static_cast<uint8_t>(dec.read(mixed_hi));
+                hi_models[ctx].increment(hi);
+                hi_class_priors[lo_hi0_ctx].increment(hi);
+                if (hi_class_priors[lo_hi0_ctx].getTotal() > HI_PRIOR_CAP)
+                    hi_class_priors[lo_hi0_ctx].halve();
+
+                if (hi == 0) {
+                    int lo_idx = lo_hi0_ctx * LO_HI0_PREV_BINS
+                               + quantize_prev_lo(prev_lo_hi0);
+                    lo = static_cast<uint8_t>(dec.read(lo_hi0_models[lo_idx]));
+                    lo_hi0_models[lo_idx].increment(lo);
+                    prev_lo_hi0 = lo;
+                } else {
+                    lo = static_cast<uint8_t>(dec.read(lo_hip_models[hi - 1]));
+                    lo_hip_models[hi - 1].increment(lo);
+                }
+
+                uint16_t z      = (static_cast<uint16_t>(hi) << 8) | lo;
+                uint16_t u_norm = zigzag_decode(z);
+                uint16_t pred   = (row == 0 && col == 0) ? 0u : med_predict(W, N, NW);
+                uint16_t pred_adj = static_cast<uint16_t>(
+                    static_cast<int>(pred) + sign * C[ctx]);
+                uint16_t u = u_norm;
+                if (sign == -1) u = static_cast<uint16_t>(0u - u_norm);
+                pixels[row * width + col] = static_cast<uint16_t>(pred_adj + u);
+
+                int r_s = (u_norm <= 32767u) ? static_cast<int>(u_norm)
+                                             : static_cast<int>(u_norm) - 65536;
+                B[ctx] += r_s; Nc[ctx]++;
+                if (B[ctx] > Nc[ctx]) {
+                    C[ctx]++; B[ctx] -= Nc[ctx];
+                    if (B[ctx] > Nc[ctx]) B[ctx] = Nc[ctx];
+                } else if (B[ctx] < -Nc[ctx]) {
+                    C[ctx]--; B[ctx] += Nc[ctx];
+                    if (B[ctx] < -Nc[ctx]) B[ctx] = -Nc[ctx];
+                }
+                if (Nc[ctx] == 512) { Nc[ctx] >>= 1; B[ctx] >>= 1; }
+            }
         }
     }
 
