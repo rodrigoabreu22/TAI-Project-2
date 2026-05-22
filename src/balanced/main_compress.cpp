@@ -28,8 +28,9 @@
  *  Then       : tile_sizes[ntiles] uint32_t LE each
  *  Then       : tile bitstreams concatenated
  *
- * Usage:  compress_astro_balanced <input_file> <output_file>
- *         compress_astro_balanced          (stdin → stdout)
+ * Usage:  compress_astro_balanced n_rows n_cols <input_file> <output_file>
+ *         compress_astro_balanced <input_file> <output_file>   (default 1500x1500)
+ *         compress_astro_balanced                              (stdin → stdout, auto-detect)
  */
 
 #include <algorithm>
@@ -84,32 +85,47 @@ int main(int argc, char* argv[]) {
     std::ostream* out_ptr = &std::cout;
     std::ifstream fin;
     std::ofstream fout;
+    uint32_t forced_width = 0, forced_height = 0;
 
-    if (argc >= 3) {
+    if (argc == 5) {
+        // compress_astro_balanced n_rows n_cols input output
+        forced_height = static_cast<uint32_t>(std::atoi(argv[1]));
+        forced_width  = static_cast<uint32_t>(std::atoi(argv[2]));
+        if (forced_height == 0 || forced_width == 0) {
+            std::cerr << "Invalid dimensions: " << argv[1] << "x" << argv[2] << '\n'; return 1;
+        }
+        fin.open(argv[3], std::ios::binary);
+        if (!fin)  { std::cerr << "Cannot open input: "  << argv[3] << '\n'; return 1; }
+        fout.open(argv[4], std::ios::binary);
+        if (!fout) { std::cerr << "Cannot open output: " << argv[4] << '\n'; return 1; }
+        in_ptr  = &fin;
+        out_ptr = &fout;
+    } else if (argc == 3) {
+        // compress_astro_balanced input output  (default 1500x1500)
+        forced_width = forced_height = 1500;
         fin.open(argv[1], std::ios::binary);
         if (!fin)  { std::cerr << "Cannot open input: "  << argv[1] << '\n'; return 1; }
         fout.open(argv[2], std::ios::binary);
         if (!fout) { std::cerr << "Cannot open output: " << argv[2] << '\n'; return 1; }
         in_ptr  = &fin;
         out_ptr = &fout;
-    } else if (argc == 1) {
-        std::cin.sync_with_stdio(false);
     } else {
-        std::cerr << "Usage: compress_astro_balanced <input> <output>\n"; return 1;
+        std::cerr << "Usage: compress_astro_balanced n_rows n_cols <input> <output>\n"
+                  << "       compress_astro_balanced <input> <output>    (default 1500x1500)\n";
+        return 1;
     }
 
     std::vector<uint8_t> raw(std::istreambuf_iterator<char>(*in_ptr), {});
     if (raw.size() % 2 != 0) { std::cerr << "Input size not even\n"; return 1; }
 
     const uint64_t npix = raw.size() / 2;
-    uint32_t width = 0, height = 0;
-    uint32_t sq = static_cast<uint32_t>(std::sqrt(static_cast<double>(npix)));
-    if ((uint64_t)sq * sq == npix) {
-        width = height = sq;
-    } else {
-        width = static_cast<uint32_t>(npix); height = 1;
-        for (uint32_t w : {1500u, 2048u, 1024u, 512u, 256u})
-            if (npix % w == 0) { width = w; height = static_cast<uint32_t>(npix / w); break; }
+    const uint32_t width  = forced_width;
+    const uint32_t height = forced_height;
+    if (static_cast<uint64_t>(width) * height != npix) {
+        std::cerr << "Error: " << forced_height << "x" << forced_width
+                  << " = " << static_cast<uint64_t>(forced_height) * forced_width
+                  << " pixels but file contains " << npix << " pixels\n";
+        return 1;
     }
 
     std::vector<uint16_t> pixels(npix);
