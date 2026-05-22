@@ -13,7 +13,7 @@
 #                 show one summary table with total sizes and summed times.
 #                 bits/byte = total_compressed_bits / total_original_bytes.
 #                 Lossless = YES only if every file round-tripped correctly.
-#   -e            Evaluation mode: runs only -o tools on files A-H.
+#   -e            Evaluation mode: runs all compressors (built-in + -o tools) on files A-H.
 #                 Faster than -m (skips A-M and standard compressors). Implies -m.
 #   -o TOOL_CMD   Add your own tool. Format: "name:compress_cmd:decompress_cmd"
 #                 Use %i/%o placeholders for file-argument tools:
@@ -492,13 +492,6 @@ printf "${W}  Runs per compressor: $RUNS${N}\n"
 printf "${W}========================================================${N}\n"
 
 if $EVAL_MODE; then
-    # In eval mode only run user's own tools (strip built-in compressors)
-    NAMES=(); COMP_CMDS=(); DECOMP_CMDS=()
-    for OWN_TOOL in "${OWN_TOOLS[@]}"; do
-        IFS=':' read -r own_name own_comp own_decomp <<< "$OWN_TOOL"
-        add_compressor "$own_name" "$own_comp" "$own_decomp"
-    done
-    [[ ${#NAMES[@]} -eq 0 ]] && err "Eval mode (-e) requires at least one -o tool."
     bench_files_eval
 elif $CONCAT_MODE; then
     cat_file="$WORK_DIR/concat"
