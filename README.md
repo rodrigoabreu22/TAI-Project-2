@@ -5,7 +5,7 @@ Data-specific lossless compressor for raw astronomical images. Input is a raw ra
 
 | Tool | Strategy | bits/byte (baseline) |
 |------|----------|---------------------|
-| `ox-astro-ratio`    | JPEG-LS MED + ORDER-1 hi + ORDER-1(hi) lo | 3.609 |
+| `ox-astro-ratio`    | JPEG-LS MED + 365-context spatial model + context mixing + bias correction | **3.497** |
 | `ox-astro-balanced` | JPEG-LS MED + ORDER-1 hi + ORDER-0 lo     | 3.611 |
 | `ox-astro-fast`     | Horizontal delta + ORDER-0                | 3.601 |
 
@@ -38,17 +38,18 @@ Produces binaries in `build/`:
 ## Usage
 
 ```bash
-# Compress
-./build/compress_astro_ratio <input_file> <output_file>
+# Compress with explicit geometry
+./build/compress_astro_fast <n_rows> <n_cols> <input_file> <output_file>
 
 # Decompress
-./build/decompress_astro_ratio <compressed_file> <output_file>
+./build/decompress_astro_fast <compressed_file> <output_file>
 
-# Stdin/stdout mode
-./build/compress_astro_ratio < input_file > output_file
+# Example
+./build/compress_astro_fast 1000 3500 x x.enc
+./build/decompress_astro_fast x.enc x.dec
 ```
 
-The same interface applies to `_balanced` and `_fast` variants.
+The fast encoder also accepts the older `<input_file> <output_file>` form for the local benchmark script, but the required submission interface is the explicit `<n_rows> <n_cols> <input_file> <output_file>` form.
 
 ## Data
 
@@ -66,22 +67,22 @@ Run against `gzip`, `bzip2`, `lzma`, `xz`, and `zstd` (per-file mean over files 
   -o "ox-astro-fast:./build/compress_astro_fast %i %o:./build/decompress_astro_fast %i %o"
 ```
 
-### Baseline results (per-file mean over A–H, 34.33 MB total)
+### Current results (per-file mean over A–H, 34.33 MB total)
 
 | Rank | Compressor | bits/byte | t_comp (s) | t_decomp (s) | Lossless |
 |-----:|:-----------|----------:|-----------:|-------------:|:--------:|
-| 1 | bzip2 | 3.579 | 0.38 | 0.26 | YES |
-| **2** | **ox-astro-fast** | **3.601** | **1.16** | **1.20** | **YES** |
-| **3** | **ox-astro-ratio** | **3.609** | **1.09** | **1.24** | **YES** |
-| **4** | **ox-astro-balanced** | **3.611** | **1.09** | **1.32** | **YES** |
-| 5 | lzma-5 | 3.679 | 1.95 | 0.19 | YES |
-| 6 | lzma-9 | 3.684 | 2.09 | 0.18 | YES |
-| 7 | xz-6 | 3.685 | 2.04 | 0.18 | YES |
-| 8 | lzma-1 | 3.916 | 0.57 | 0.20 | YES |
-| 9 | zstd-19 | 4.156 | 1.89 | 0.02 | YES |
-| 10 | zstd-3 | 4.324 | 0.10 | 0.05 | YES |
-| 11 | gzip | 4.376 | 0.45 | 0.09 | YES |
-| 12 | zstd-1 | 4.487 | 0.06 | 0.02 | YES |
+| **1** | **ox-astro-ratio** | **3.497** | **0.26** | **0.28** | **YES** |
+| 2 | bzip2 | 3.579 | 0.36 | 0.21 | YES |
+| **3** | **ox-astro-fast** | **3.601** | **0.98** | **1.18** | **YES** |
+| **4** | **ox-astro-balanced** | **3.611** | **0.93** | **1.12** | **YES** |
+| 5 | lzma-5 | 3.679 | 1.60 | 0.16 | YES |
+| 6 | lzma-9 | 3.684 | 1.51 | 0.16 | YES |
+| 7 | xz-6 | 3.685 | 1.55 | 0.15 | YES |
+| 8 | lzma-1 | 3.916 | 0.42 | 0.16 | YES |
+| 9 | zstd-19 | 4.156 | 1.38 | 0.02 | YES |
+| 10 | zstd-3 | 4.324 | 0.07 | 0.02 | YES |
+| 11 | gzip | 4.376 | 0.43 | 0.07 | YES |
+| 12 | zstd-1 | 4.487 | 0.04 | 0.01 | YES |
 
 ## Algorithm
 
@@ -105,14 +106,13 @@ This concentrates probability mass near 0 regardless of residual sign.
 
 | | Predictor | hi model | lo model | Models total | Magic |
 |---|-----------|----------|----------|--------------|-------|
-| **ratio** | JPEG-LS MED | ORDER-1 (256 tables, ctx=prev hi) | ORDER-1 (256 tables, ctx=current hi) | 512 | `TA2A` |
-| **balanced** | JPEG-LS MED | ORDER-1 (256 tables, ctx=prev hi) | ORDER-0 (1 shared table) | 257 | `TA2B` |
+| **ratio** | Adaptive (MED or global-mean, chosen per-file by entropy pre-scan) | MED mode: 365 spatial contexts + 4 class priors. Mean mode: 16 hi-neighbor contexts | 32 tables (hi=0, grad_class×prev_lo_bin) + 255 tables (hi>0) | 381 or 16+287 | `TA2A` |
+| **balanced** | Adaptive (GAP or global-mean, chosen per-file by entropy pre-scan) | 16 hi-neighbor contexts (both modes) | 32 tables (hi=0) + 255 tables (hi>0) | 303 | `TA2B` |
 | **fast** | Horizontal delta (left neighbour) | ORDER-0 (1 table) | ORDER-0 (1 table) | 2 | `TA2F` |
 
-**JPEG-LS MED predictor** (`W`=left, `N`=above, `NW`=above-left):
+**Neighbours used by ratio** (`W`=left, `WW`=two-left, `N`=above, `NW`=above-left):
 ```
-if   NW ≥ max(W, N):  pred = min(W, N)
-elif NW ≤ min(W, N):  pred = max(W, N)
-else:                 pred = W + N − NW
+MED:  if NW ≥ max(W,N): pred=min(W,N)  elif NW ≤ min(W,N): pred=max(W,N)  else: pred=W+N−NW
+Mean: pred = global image mean  (calibration-type images)
 ```
-Selects horizontal/vertical prediction at edges and bilinear interpolation in smooth regions.
+Gradients D1=N−NW, D2=NW−W, D3=W−WW drive both the 365-context spatial index and the lo model's 4-class index.
