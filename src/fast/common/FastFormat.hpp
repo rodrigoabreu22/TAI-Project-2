@@ -7,7 +7,7 @@
 namespace fast {
 
 inline constexpr char kMagic[4] = {'T', 'A', '2', 'F'};
-inline constexpr std::uint32_t kRowsPerChunk = 64;
+inline constexpr std::uint32_t kChunkCount = 8;
 inline constexpr std::uint32_t kRescaleThreshold = 16384u;
 
 enum class BlockMode : std::uint8_t {

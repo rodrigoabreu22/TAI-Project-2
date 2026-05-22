@@ -38,17 +38,18 @@ Produces binaries in `build/`:
 ## Usage
 
 ```bash
-# Compress
-./build/compress_astro_ratio <input_file> <output_file>
+# Compress with explicit geometry
+./build/compress_astro_fast <n_rows> <n_cols> <input_file> <output_file>
 
 # Decompress
-./build/decompress_astro_ratio <compressed_file> <output_file>
+./build/decompress_astro_fast <compressed_file> <output_file>
 
-# Stdin/stdout mode
-./build/compress_astro_ratio < input_file > output_file
+# Example
+./build/compress_astro_fast 1000 3500 x x.enc
+./build/decompress_astro_fast x.enc x.dec
 ```
 
-The same interface applies to `_balanced` and `_fast` variants.
+The fast encoder also accepts the older `<input_file> <output_file>` form for the local benchmark script, but the required submission interface is the explicit `<n_rows> <n_cols> <input_file> <output_file>` form.
 
 ## Data
 
