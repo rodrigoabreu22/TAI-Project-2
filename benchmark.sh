@@ -384,7 +384,7 @@ bench_files_aggregate() {
 }
 
 # ---------- evaluation mode aggregate (-e) -----------------------------------
-# Only runs user's own tools on A-H; merges results with hardcoded baselines.
+# Runs all compressors on A-H; prints aggregate table then per-file bpb matrix.
 bench_files_eval() {
     local eval_files=()
     for letter in A B C D E F G H; do
@@ -400,8 +400,8 @@ bench_files_eval() {
     local total_orig_mb
     total_orig_mb=$(bytes_to_mb "$total_orig")
 
-    # Run only user's own tools
     declare -A acc_comp acc_tc acc_td acc_ok
+    declare -A per_file_bpb   # key: "file:compressor"
     local i
     for (( i=0; i<${#NAMES[@]}; i++ )); do
         local n="${NAMES[$i]}"
@@ -410,6 +410,8 @@ bench_files_eval() {
 
     for f in "${eval_files[@]}"; do
         local fp="$DATA_DIR/$f"
+        local orig_bytes
+        orig_bytes=$(stat -c%s "$fp")
         log "File $f"
         for (( i=0; i<${#NAMES[@]}; i++ )); do
             local n="${NAMES[$i]}"
@@ -419,14 +421,12 @@ bench_files_eval() {
             acc_tc[$n]=$(echo "${acc_tc[$n]} + $tc" | bc)
             acc_td[$n]=$(echo "${acc_td[$n]} + $td" | bc)
             [[ "$ls" != "YES" ]] && acc_ok[$n]="false"
+            per_file_bpb["${f}:${n}"]=$(bits_per_sym "$orig_bytes" "$cb")
         done
     done
 
-    # Build sortable list: "sort_key display_line"
-    # sort_key = compressed bytes (integer, for numeric sort)
+    # Build sortable list: compressed_bytes|name|fields...
     local sort_input=""
-
-    # User tools
     for (( i=0; i<${#NAMES[@]}; i++ )); do
         local n="${NAMES[$i]}"
         local cb="${acc_comp[$n]}"
@@ -441,17 +441,18 @@ bench_files_eval() {
         sort_input+="$cb|$n|$total_orig_mb|$comp_mb|${ratio}%|$bpb|$tc|$td|$tt|$lm"$'\n'
     done
 
-    # Sort by compressed bytes
     mapfile -t sorted_rows <<< "$(echo "$sort_input" | grep -v '^$' | sort -t'|' -k1 -n)"
 
     local label
     label="Per-file aggregate ($(IFS=+; echo "${eval_files[*]}"))  —  ${num_files} files, ${total_orig_mb} MB total  [times = mean per file]"
     print_header "$label"
 
+    local -a sorted_names=()
     local rank=1
     for entry in "${sorted_rows[@]}"; do
         [[ -z "$entry" ]] && continue
         IFS='|' read -r _ n orig_mb comp_mb ratio bpb tc td tt lm <<< "$entry"
+        sorted_names+=("$n")
         local lossless_mark
         [[ "$lm" == "YES" ]] && lossless_mark="${G}YES${N}" || lossless_mark="${R}NO ${N}"
         printf "| %-4s | %-14s | %12s | %12s | %6s | %9s | %9s | %9s | %9s | %-9b |\n" \
@@ -461,6 +462,35 @@ bench_files_eval() {
     done
     separator
     echo ""
+
+    # --- Per-file bits/byte matrix (markdown) --------------------------------
+    printf "\n${W}Per-file bits/byte — paste into benchmarks.md:${N}\n\n"
+
+    # Header row
+    printf "| File |"
+    for n in "${sorted_names[@]}"; do printf " %s |" "$n"; done
+    printf "\n"
+
+    # Separator row (right-align numbers)
+    printf "|:----:|"
+    for n in "${sorted_names[@]}"; do printf '%s' "------:|"; done
+    printf "\n"
+
+    # One row per file
+    for f in "${eval_files[@]}"; do
+        printf "| **%s** |" "$f"
+        for n in "${sorted_names[@]}"; do
+            printf " %s |" "${per_file_bpb[${f}:${n}]:-N/A}"
+        done
+        printf "\n"
+    done
+
+    # Mean row
+    printf "| **Mean** |"
+    for n in "${sorted_names[@]}"; do
+        printf " **%s** |" "$(bits_per_sym "$total_orig" "${acc_comp[$n]}")"
+    done
+    printf "\n\n"
 }
 
 # ---------- main -------------------------------------------------------------
