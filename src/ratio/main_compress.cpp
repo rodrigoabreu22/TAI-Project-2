@@ -78,49 +78,42 @@ static int quantize_hi_val(uint8_t h) {
 }
 
 int main(int argc, char* argv[]) {
-    std::istream* in_ptr  = &std::cin;
-    std::ostream* out_ptr = &std::cout;
+    uint32_t height = 0, width = 0;
     std::ifstream fin;
     std::ofstream fout;
 
-    if (argc >= 3) {
+    if (argc == 5) {
+        // compress_astro_ratio n_rows n_cols input output
+        height = static_cast<uint32_t>(std::stoul(argv[1]));
+        width  = static_cast<uint32_t>(std::stoul(argv[2]));
+        if (height == 0 || width == 0) {
+            std::cerr << "Invalid dimensions: " << argv[1] << "x" << argv[2] << '\n'; return 1;
+        }
+        fin.open(argv[3], std::ios::binary);
+        if (!fin)  { std::cerr << "Cannot open input: "  << argv[3] << '\n'; return 1; }
+        fout.open(argv[4], std::ios::binary);
+        if (!fout) { std::cerr << "Cannot open output: " << argv[4] << '\n'; return 1; }
+    } else if (argc == 3) {
+        // compress_astro_ratio input output  (default 1500x1500)
+        height = width = 1500;
         fin.open(argv[1], std::ios::binary);
-        if (!fin) { std::cerr << "Cannot open input: " << argv[1] << '\n'; return 1; }
+        if (!fin)  { std::cerr << "Cannot open input: "  << argv[1] << '\n'; return 1; }
         fout.open(argv[2], std::ios::binary);
         if (!fout) { std::cerr << "Cannot open output: " << argv[2] << '\n'; return 1; }
-        in_ptr  = &fin;
-        out_ptr = &fout;
-    } else if (argc == 1) {
-        std::cin.sync_with_stdio(false);
     } else {
-        std::cerr << "Usage: compress_astro_ratio <input> <output>\n"; return 1;
+        std::cerr << "Usage: compress_astro_ratio n_rows n_cols <input> <output>\n"
+                  << "       compress_astro_ratio <input> <output>    (default 1500x1500)\n";
+        return 1;
     }
 
-    // Read entire input
-    std::vector<uint8_t> raw(std::istreambuf_iterator<char>(*in_ptr), {});
-    if (raw.size() % 2 != 0) {
-        std::cerr << "Input size not even — not a valid 16-bit raster\n"; return 1;
+    std::vector<uint8_t> raw(std::istreambuf_iterator<char>(fin), {});
+    const uint64_t npix = static_cast<uint64_t>(height) * width;
+    if (raw.size() != npix * 2) {
+        std::cerr << "File has " << raw.size() << " bytes but "
+                  << height << "x" << width << " requires " << npix * 2 << " bytes\n";
+        return 1;
     }
 
-    // Infer dimensions: expect square image, or rectangular if exact match
-    const uint64_t npix = raw.size() / 2;
-    uint32_t width = 0, height = 0;
-    // Try square first
-    uint32_t sq = static_cast<uint32_t>(std::sqrt(static_cast<double>(npix)));
-    if ((uint64_t)sq * sq == npix) {
-        width = height = sq;
-    } else {
-        // Common rectangular sizes: try 1500×1500, 1000×1000, 2048×1024, etc.
-        // Fall back to 1×npix (1D mode)
-        width  = static_cast<uint32_t>(npix);
-        height = 1;
-        // Try common widths
-        for (uint32_t w : {1500u, 2048u, 1024u, 512u, 256u}) {
-            if (npix % w == 0) { width = w; height = static_cast<uint32_t>(npix / w); break; }
-        }
-    }
-
-    // Decode big-endian uint16_t pixels into host order
     std::vector<uint16_t> pixels(npix);
     for (uint64_t i = 0; i < npix; ++i)
         pixels[i] = (static_cast<uint16_t>(raw[2*i]) << 8) | raw[2*i+1];
@@ -213,12 +206,12 @@ int main(int argc, char* argv[]) {
     const bool use_mean = (e_med - e_mean) > MEAN_PRED_THRESHOLD;
 
     // Write header
-    out_ptr->write(reinterpret_cast<const char*>(MAGIC), 4);
-    write_u32le(*out_ptr, width);
-    write_u32le(*out_ptr, height);
-    out_ptr->put(static_cast<char>(use_mean ? 1 : 0));
-    out_ptr->put(static_cast<char>(global_mean & 0xFF));
-    out_ptr->put(static_cast<char>((global_mean >> 8) & 0xFF));
+    fout.write(reinterpret_cast<const char*>(MAGIC), 4);
+    write_u32le(fout, width);
+    write_u32le(fout, height);
+    fout.put(static_cast<char>(use_mean ? 1 : 0));
+    fout.put(static_cast<char>(global_mean & 0xFF));
+    fout.put(static_cast<char>((global_mean >> 8) & 0xFF));
 
     // hi models (365): fine per-context adaptive models.
     // hi_class_priors (4): gradient-class priors for context mixing.
@@ -252,7 +245,7 @@ int main(int argc, char* argv[]) {
     std::vector<int> B(NUM_CONTEXTS, 0);
     std::vector<int> Nc(NUM_CONTEXTS, 0);
 
-    RangeEncoder enc(*out_ptr);
+    RangeEncoder enc(fout);
 
     uint8_t prev_lo_hi0 = 0;  // lo of last pixel whose hi byte was 0
     std::vector<uint8_t> hi_N_arr(width, 0u);  // hi values of row above (for mean mode)
